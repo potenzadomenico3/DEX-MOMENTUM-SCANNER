@@ -1,0 +1,3164 @@
+#!/usr/bin/env python3
+"""DEX Momentum Scanner v0.2.3.1 — prospective READ ONLY observation; corrected coverage reporting.
+
+Python 3.10+, standard library only. No wallet, private key or transactions.
+Separate v0.2.3.1 SQLite schema/database; never modifies V0.2.3 or any earlier version.
+Scope: Base; 30m young and 15m mature precommitted observation leases.
+
+Examples (after manual upload to GitHub and git pull on VPS):
+  .venv/bin/python dex_momentum_scanner_v0231.py --self-test
+  .venv/bin/python dex_momentum_scanner_v0231.py --once
+  .venv/bin/python dex_momentum_scanner_v0231.py --cycles 30
+  .venv/bin/python dex_momentum_scanner_v0231.py --discovery-hours 72 --drain-followups
+  .venv/bin/python dex_momentum_scanner_v0231.py --report
+  .venv/bin/python dex_momentum_scanner_v0231.py --export-csv data/signals_v0231.csv
+  .venv/bin/python dex_momentum_scanner_v0231.py --export-exploratory-csv data/exploratory_v0231.csv
+  .venv/bin/python dex_momentum_scanner_v0231.py --export-candidates-csv data/candidates_v0231.csv
+
+Signal thresholds are FROZEN from v0.1; young official paper signals are non-executable research
+observations. Pool rankings are selected by API providers and are NOT a neutral
+universe. Absence of quotes is never imputed as zero/rug. Missing assignments
+and failed requests BREAK observable baseline continuity. Do not infer alpha.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import logging
+import math
+import os
+import random
+import sqlite3
+import sys
+import tempfile
+import time
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+from collections import Counter, defaultdict, deque
+from bisect import bisect_left, bisect_right
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+VERSION = "0.2.3.1"
+SCHEMA_VERSION = 6
+RULE_VERSION = "v01_frozen_2026_10_09"
+GECKO = "https://api.geckoterminal.com/api/v2"
+DEX = "https://api.dexscreener.com"
+FOLLOWUP_MS = 86_400_000
+HTTP_BODY_MAX = 5_000_000
+LOG = logging.getLogger("dex_momentum_v0231")
+
+
+def now_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def iso(ms: Optional[int]) -> str:
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).isoformat(timespec="milliseconds") if ms is not None else "unknown"
+
+
+def numeric(x: Any) -> Optional[float]:
+    try:
+        if x is None or isinstance(x, bool):
+            return None
+        n = float(x)
+        return n if math.isfinite(n) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def positive(x: Any) -> Optional[float]:
+    n = numeric(x)
+    return n if n is not None and n > 0 else None
+
+
+def nonnegative(x: Any) -> Optional[float]:
+    n = numeric(x)
+    return n if n is not None and n >= 0 else None
+
+
+def natural_int(x: Any) -> Optional[int]:
+    n = nonnegative(x)
+    return int(n) if n is not None and n.is_integer() else None
+
+
+def timestamp_ms(x: Any) -> Optional[int]:
+    n = positive(x)
+    return int(n) if n is not None else None
+
+
+def dt_ms(x: Any) -> Optional[int]:
+    if not isinstance(x, str):
+        return None
+    try:
+        d = dt.datetime.fromisoformat(x.replace("Z", "+00:00"))
+        return int(d.timestamp() * 1000) if d.tzinfo else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def canon(x: Any) -> str:
+    return json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha(x: bytes) -> str:
+    return hashlib.sha256(x).hexdigest()
+
+
+def dictobj(x: Any) -> dict:
+    return x if isinstance(x, dict) else {}
+
+
+def address(x: Any) -> str:
+    return str(x or "").strip().lower()
+
+
+def key(x: Any) -> str:
+    return "base:" + address(x)
+
+
+def batches(items: list, size: int):
+    for pos in range(0, len(items), size):
+        yield items[pos:pos + size]
+
+
+@dataclass(frozen=True)
+class Config:
+    db: str = "data/dex_momentum_v0231.sqlite3"
+    interval: int = 60
+    discovery_every: int = 180
+    max_pools: int = 90
+    gecko_pages: int = 1
+    promoted: bool = False
+    seed: str = "dex-momentum-v023-frozen-admissions-a"
+    mature_max_pools: int = 20  # Target reserved quota; no premature lease eviction.
+    young_target_pools: int = 70
+    young_window_s: int = 1800  # Measured from first discovery, NOT admission.
+    mature_window_s: int = 900  # Measured from first observed Gecko trending entry.
+    admission_warmup_s: int = 180  # Minimum remaining time before admitting a new lease.
+    followup_gap_factor: float = 2.5  # reporting threshold; never imputes missing prices.
+    mature_watch_s: int = 86_400  # 24h from first trending observation
+    request_timeout: float = 12.0
+    # Immutable v0.1 filter specification. No CLI switches to retune these.
+    min_age_s: int = 120
+    max_age_s: int = 86_400
+    baseline_min_s: int = 120
+    baseline_max_s: int = 900
+    min_observed_gain_pct: float = 2.0
+    min_m5_gain_pct: float = 3.0
+    min_liquidity_usd: float = 10_000.0
+    min_volume_m5_usd: float = 3_000.0
+    min_tx_m5: int = 20
+    min_buy_sell_ratio: float = 1.25
+
+    def research_dict(self) -> dict:
+        d = asdict(self)
+        d.pop("db")  # An output location is not a methodological parameter.
+        return d
+
+    def digest(self) -> str:
+        return sha(canon(self.research_dict()).encode())
+
+
+class WriterLocked(Exception):
+    pass
+
+
+class Store:
+    """Single SQLite writer guarded by an OS flock; reports use read-only URI."""
+    def __init__(self, db_path: str, write: bool = True):
+        self.db_path = Path(db_path).absolute()
+        if write and self.db_path.name in ("dex_momentum_v01.sqlite3", "dex_momentum_v02.sqlite3", "dex_momentum_v021.sqlite3", "dex_momentum_v022.sqlite3", "dex_momentum_v023.sqlite3"):
+            raise ValueError("refusing to modify legacy V0.1/V0.2/V0.2.1 database")
+        self.write = write
+        self.lock_file = None
+        if write:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_file = open(str(self.db_path) + ".writer.lock", "a+b")
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                self.lock_file.close()
+                raise WriterLocked("a scanner writer is already running for this V0.2.3.1 database") from exc
+        elif not self.db_path.is_file():
+            raise FileNotFoundError(f"V0.2.3.1 database not found: {self.db_path}")
+        try:
+            if write:
+                self.cx = sqlite3.connect(str(self.db_path), timeout=20)
+            else:
+                self.cx = sqlite3.connect(self.db_path.as_uri() + "?mode=ro", uri=True, timeout=20)
+            self.cx.row_factory = sqlite3.Row
+            self.cx.execute("PRAGMA busy_timeout=20000")
+            self.cx.execute("PRAGMA foreign_keys=ON")
+            if write:
+                self.schema()
+                self.cx.execute("PRAGMA journal_mode=WAL")
+            else:
+                version = self.cx.execute("PRAGMA user_version").fetchone()[0]
+                if version != SCHEMA_VERSION:
+                    raise ValueError(f"unexpected schema version: {version}")
+        except Exception:
+            if hasattr(self, "cx"):
+                self.cx.close()
+            if self.lock_file:
+                self.lock_file.close()
+            raise
+
+    def close(self):
+        self.cx.close()
+        if self.lock_file:
+            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            self.lock_file.close()
+
+    def schema(self):
+        version = self.cx.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, SCHEMA_VERSION):
+            raise ValueError(f"unexpected DB schema={version}; do not overwrite or migrate blindly")
+        if version == 0:
+            existing = self.cx.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+            if existing:
+                raise ValueError("Unversioned/non-V0.2.3.1 tables detected: refusing to touch existing database (legacy DB protection)")
+        self.cx.executescript("""
+        CREATE TABLE IF NOT EXISTS runs (
+          id INTEGER PRIMARY KEY, started_ms INTEGER NOT NULL, ended_ms INTEGER,
+          version TEXT NOT NULL, schema_version INTEGER NOT NULL,
+          config_json TEXT NOT NULL, config_hash TEXT NOT NULL,
+          code_sha256 TEXT NOT NULL, seed TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS campaigns (
+          id INTEGER PRIMARY KEY, started_ms INTEGER NOT NULL,
+          discovery_end_ms INTEGER NOT NULL, discovery_hours INTEGER NOT NULL,
+          config_hash TEXT NOT NULL, completed_ms INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS cycles (
+          id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
+          started_ms INTEGER NOT NULL, finished_ms INTEGER, eligible INTEGER,
+          assigned INTEGER, sampled INTEGER, capacity_skips INTEGER,
+          api_failed_slots INTEGER, signals_new INTEGER, phase TEXT NOT NULL DEFAULT 'discovery',
+          mature_borrowed_slots INTEGER NOT NULL DEFAULT 0,
+          waiting_admission INTEGER NOT NULL DEFAULT 0,
+          new_admissions INTEGER NOT NULL DEFAULT 0,
+          active_windows INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS api_calls (
+          id INTEGER PRIMARY KEY, provider TEXT NOT NULL, endpoint TEXT NOT NULL,
+          requested_ms INTEGER NOT NULL, responded_ms INTEGER NOT NULL,
+          http_status INTEGER, ok INTEGER NOT NULL, error TEXT,
+          retry_number INTEGER NOT NULL, payload_sha256 TEXT,
+          payload_zlib BLOB
+        );
+        CREATE TABLE IF NOT EXISTS pools (
+          pool_key TEXT PRIMARY KEY, address TEXT NOT NULL, first_seen_ms INTEGER NOT NULL,
+          created_ms INTEGER, dex_id TEXT, base_token TEXT, base_symbol TEXT,
+          quote_token TEXT
+        );
+        CREATE TABLE IF NOT EXISTS tokens (
+          token_key TEXT PRIMARY KEY, address TEXT NOT NULL,
+          first_seen_ms INTEGER NOT NULL, last_resolved_ms INTEGER,
+          resolved_pairs INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS discoveries (
+          id INTEGER PRIMARY KEY, observed_ms INTEGER NOT NULL,
+          source TEXT NOT NULL, kind TEXT NOT NULL, item_key TEXT NOT NULL,
+          rank INTEGER NOT NULL, api_call_id INTEGER REFERENCES api_calls(id),
+          raw_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS discoveries_item ON discoveries(item_key,observed_ms);
+        CREATE TABLE IF NOT EXISTS memberships (
+          pool_key TEXT NOT NULL REFERENCES pools(pool_key),
+          source TEXT NOT NULL, first_seen_ms INTEGER NOT NULL,
+          last_seen_ms INTEGER NOT NULL, first_rank INTEGER,
+          first_call_id INTEGER REFERENCES api_calls(id),
+          PRIMARY KEY(pool_key,source)
+        );
+        CREATE INDEX IF NOT EXISTS memberships_source ON memberships(source,pool_key);
+        CREATE TABLE IF NOT EXISTS assignments (
+          id INTEGER PRIMARY KEY, cycle_id INTEGER NOT NULL REFERENCES cycles(id),
+          pool_key TEXT NOT NULL REFERENCES pools(pool_key),
+          assigned_ms INTEGER NOT NULL, stratum TEXT NOT NULL, rank_in_stratum INTEGER,
+          disposition TEXT NOT NULL CHECK(disposition IN
+            ('selected','sampled','skipped_capacity','api_failure','temporarily_ineligible','waiting_admission')),
+          reason TEXT, api_call_id INTEGER REFERENCES api_calls(id),
+          snapshot_id INTEGER,
+          UNIQUE(cycle_id,pool_key)
+        );
+        -- Each (pool,cohort) has ONE immutable eligibility origin and ONE
+        -- terminal admission decision. No time-window reset on rediscovery/restart.
+        CREATE TABLE IF NOT EXISTS candidate_windows (
+          pool_key TEXT NOT NULL REFERENCES pools(pool_key),
+          cohort TEXT NOT NULL CHECK(cohort IN ('young','mature_trending')),
+          origin_ms INTEGER NOT NULL,
+          window_end_ms INTEGER NOT NULL,
+          admission_deadline_ms INTEGER NOT NULL,
+          seed_rank TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN
+            ('queued','admitted','observing','baseline_ready','signal_followup',
+             'not_admitted_capacity','not_admitted_late','not_admitted_campaign_end','watch_completed_no_signal',
+             'observation_incomplete','closed')),
+          first_candidate_ms INTEGER NOT NULL,
+          admitted_ms INTEGER,
+          first_sample_ms INTEGER,
+          last_sample_ms INTEGER,
+          sample_count INTEGER NOT NULL DEFAULT 0,
+          bad_quote_count INTEGER NOT NULL DEFAULT 0,
+          failed_slot_count INTEGER NOT NULL DEFAULT 0,
+          baseline_reached INTEGER NOT NULL DEFAULT 0,
+          closed_ms INTEGER,
+          reason TEXT,
+          PRIMARY KEY(pool_key,cohort)
+        );
+        CREATE INDEX IF NOT EXISTS candidate_state_idx
+          ON candidate_windows(state,cohort,origin_ms);
+        CREATE TABLE IF NOT EXISTS candidate_events (
+          id INTEGER PRIMARY KEY,
+          pool_key TEXT NOT NULL,
+          cohort TEXT NOT NULL,
+          occurred_ms INTEGER NOT NULL,
+          cycle_id INTEGER REFERENCES cycles(id),
+          old_state TEXT,
+          new_state TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          FOREIGN KEY(pool_key,cohort) REFERENCES candidate_windows(pool_key,cohort)
+        );
+        CREATE INDEX IF NOT EXISTS candidate_events_time
+          ON candidate_events(pool_key,cohort,occurred_ms);
+        CREATE INDEX IF NOT EXISTS assignments_key_time ON assignments(pool_key,assigned_ms);
+        CREATE TABLE IF NOT EXISTS snapshots (
+          id INTEGER PRIMARY KEY, pool_key TEXT NOT NULL REFERENCES pools(pool_key),
+          observed_ms INTEGER NOT NULL, api_call_id INTEGER REFERENCES api_calls(id),
+          status TEXT NOT NULL CHECK(status IN ('ok','unpriced','missing')),
+          price_usd REAL, liquidity_usd REAL, volume_m5_usd REAL,
+          buys_m5 INTEGER, sells_m5 INTEGER, change_m5_pct REAL,
+          pair_created_ms INTEGER, UNIQUE(pool_key,observed_ms)
+        );
+        CREATE INDEX IF NOT EXISTS snapshots_key_time ON snapshots(pool_key,observed_ms);
+        CREATE TABLE IF NOT EXISTS filter_decisions (
+          snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(id),
+          decided_ms INTEGER NOT NULL, rule_version TEXT NOT NULL,
+          baseline_id INTEGER REFERENCES snapshots(id),
+          observed_gain_pct REAL, states_json TEXT NOT NULL,
+          reasons_json TEXT NOT NULL, eligible INTEGER NOT NULL,
+          already_signaled INTEGER NOT NULL,
+          cohort TEXT NOT NULL, exploratory_eligible INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS signals (
+          id INTEGER PRIMARY KEY, pool_key TEXT NOT NULL UNIQUE REFERENCES pools(pool_key),
+          signal_ms INTEGER NOT NULL, snapshot_id INTEGER NOT NULL UNIQUE REFERENCES snapshots(id),
+          baseline_id INTEGER NOT NULL REFERENCES snapshots(id),
+          entry_usd REAL NOT NULL, baseline_usd REAL NOT NULL,
+          observed_gain_pct REAL NOT NULL, pool_age_s REAL NOT NULL,
+          source_memberships_json TEXT NOT NULL,
+          rule_version TEXT NOT NULL, config_hash TEXT NOT NULL
+        );
+        -- Mature trending triggers are exploratory markers, NOT official paper signals.
+        -- Separate identities and outcomes prevent accidental pooling of cohorts.
+        CREATE TABLE IF NOT EXISTS exploratory_triggers (
+          id INTEGER PRIMARY KEY, pool_key TEXT NOT NULL UNIQUE REFERENCES pools(pool_key),
+          trigger_ms INTEGER NOT NULL, snapshot_id INTEGER NOT NULL UNIQUE REFERENCES snapshots(id),
+          baseline_id INTEGER NOT NULL REFERENCES snapshots(id),
+          entry_usd REAL NOT NULL, baseline_usd REAL NOT NULL,
+          observed_gain_pct REAL NOT NULL, first_trending_ms INTEGER NOT NULL,
+          source_memberships_json TEXT NOT NULL, rule_version TEXT NOT NULL,
+          config_hash TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS exploratory_followups (
+          id INTEGER PRIMARY KEY, trigger_id INTEGER NOT NULL REFERENCES exploratory_triggers(id),
+          assignment_id INTEGER NOT NULL UNIQUE REFERENCES assignments(id),
+          snapshot_id INTEGER REFERENCES snapshots(id), observed_ms INTEGER,
+          status TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS signal_followups (
+          id INTEGER PRIMARY KEY, signal_id INTEGER NOT NULL REFERENCES signals(id),
+          assignment_id INTEGER NOT NULL UNIQUE REFERENCES assignments(id),
+          snapshot_id INTEGER REFERENCES snapshots(id),
+          observed_ms INTEGER, status TEXT NOT NULL,
+          UNIQUE(signal_id,assignment_id)
+        );
+        CREATE INDEX IF NOT EXISTS signal_followups_time ON signal_followups(signal_id,observed_ms);
+        CREATE TABLE IF NOT EXISTS risk_events (
+          id INTEGER PRIMARY KEY, pool_key TEXT NOT NULL REFERENCES pools(pool_key),
+          kind TEXT NOT NULL, first_observed_ms INTEGER NOT NULL,
+          reference_snapshot_id INTEGER REFERENCES snapshots(id),
+          event_snapshot_id INTEGER REFERENCES snapshots(id),
+          from_value REAL, to_value REAL, percent_change REAL,
+          status TEXT NOT NULL DEFAULT 'suspected', status_updated_ms INTEGER,
+          evidence_json TEXT NOT NULL,
+          UNIQUE(pool_key,kind,event_snapshot_id)
+        );
+        CREATE INDEX IF NOT EXISTS risk_events_key_time ON risk_events(pool_key,first_observed_ms);
+        CREATE TABLE IF NOT EXISTS risk_confirmations (
+          id INTEGER PRIMARY KEY, risk_id INTEGER NOT NULL REFERENCES risk_events(id),
+          confirmed_observed_ms INTEGER NOT NULL, snapshot_id INTEGER REFERENCES snapshots(id),
+          observation TEXT NOT NULL, UNIQUE(risk_id,snapshot_id)
+        );
+        CREATE TABLE IF NOT EXISTS operational_events (
+          id INTEGER PRIMARY KEY, observed_ms INTEGER NOT NULL,
+          level TEXT NOT NULL, category TEXT NOT NULL, detail TEXT NOT NULL
+        );
+        """)
+        with self.cx:
+            self.cx.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def reconcile_interrupted(self):
+        # An unclean shutdown must not leave falsely selected slots that a later
+        # run could use as an intact baseline. Preserve the original slot time.
+        pending = self.cx.execute("""SELECT a.* FROM assignments a
+            WHERE a.disposition='selected'""").fetchall()
+        with self.cx:
+            for a in pending:
+                self.cx.execute("""UPDATE assignments SET disposition='api_failure',
+                    reason='unclean_shutdown_before_quote' WHERE id=?""", (a["id"],))
+                s = self.cx.execute("""SELECT id FROM signals WHERE pool_key=?
+                    AND signal_ms<=? AND signal_ms+?>=?""",
+                    (a["pool_key"], a["assigned_ms"], FOLLOWUP_MS, a["assigned_ms"])).fetchone()
+                self.update_candidate_sample(a['pool_key'], a['assigned_ms'], None, None, failed=True)
+                if s:
+                    self.cx.execute("""INSERT OR IGNORE INTO signal_followups
+                        (signal_id,assignment_id,snapshot_id,observed_ms,status)
+                        VALUES (?,?,NULL,NULL,'api_failure')""", (s[0], a["id"]))
+                e = self.cx.execute("""SELECT id FROM exploratory_triggers WHERE pool_key=?
+                    AND trigger_ms<=? AND trigger_ms+?>=?""",
+                    (a["pool_key"], a["assigned_ms"], FOLLOWUP_MS, a["assigned_ms"])).fetchone()
+                if e:
+                    self.cx.execute("""INSERT OR IGNORE INTO exploratory_followups
+                        (trigger_id,assignment_id,snapshot_id,observed_ms,status)
+                        VALUES (?,?,NULL,NULL,'api_failure')""", (e[0], a["id"]))
+            unfinished = self.cx.execute("SELECT id FROM cycles WHERE finished_ms IS NULL").fetchall()
+            for row in unfinished:
+                self.cx.execute("UPDATE cycles SET finished_ms=?,api_failed_slots=(SELECT COUNT(*) FROM assignments WHERE cycle_id=? AND disposition='api_failure') WHERE id=?",
+                                (now_ms(), row[0], row[0]))
+        if pending or unfinished:
+            self.event("warning", "interrupted_cycle_recovery",
+                       f"reconciled_pending_slots={len(pending)} incomplete_cycles={len(unfinished)}")
+
+    def start_run(self, cfg: Config) -> int:
+        existing = self.cx.execute("SELECT DISTINCT config_hash FROM runs").fetchall()
+        if existing and any(r[0] != cfg.digest() for r in existing):
+            raise ValueError("FROZEN CONFIG mismatch; use a separate V0.2.3.1 database for a new configuration")
+        try:
+            code_hash = sha(Path(__file__).read_bytes())
+        except OSError:
+            code_hash = "unavailable"
+        old_code = self.cx.execute("SELECT DISTINCT code_sha256 FROM runs").fetchall()
+        if old_code and any(r[0] != code_hash for r in old_code):
+            raise ValueError("FROZEN CODE mismatch; do not mix software versions in a pilot DB")
+        self.reconcile_interrupted()
+        with self.cx:
+            c = self.cx.execute("""INSERT INTO runs(started_ms,version,schema_version,
+                config_json,config_hash,code_sha256,seed) VALUES (?,?,?,?,?,?,?)""",
+                (now_ms(), VERSION, SCHEMA_VERSION, canon(cfg.research_dict()),
+                 cfg.digest(), code_hash, cfg.seed))
+            return c.lastrowid
+
+    def prepare_campaign(self, cfg: Config, discovery_hours: int):
+        """Freeze a wall-clock experiment horizon in SQLite; restart NEVER extends it.
+
+        The pilot and the 72-hour prospective experiment must be distinct DBs.
+        A crash/restart retains the start time and original stop time.
+        """
+        rows = self.cx.execute("SELECT * FROM campaigns ORDER BY id").fetchall()
+        if rows:
+            c = rows[0]
+            if len(rows) != 1 or c["discovery_hours"] != discovery_hours or c["config_hash"] != cfg.digest():
+                raise ValueError("campaign locked: duration/config mismatch; new DB required")
+            if c["completed_ms"] is not None:
+                raise ValueError("campaign already completed; do not extend or reopen this experiment")
+            return c
+        if self.cx.execute("SELECT COUNT(*) FROM cycles").fetchone()[0]:
+            raise ValueError("start prospective campaign in an EMPTY V0.2.3.1 database, not a pilot DB")
+        at = now_ms()
+        with self.cx:
+            self.cx.execute("INSERT INTO campaigns(started_ms,discovery_end_ms,discovery_hours,config_hash) VALUES(?,?,?,?)",
+                            (at, at + discovery_hours * 3_600_000, discovery_hours, cfg.digest()))
+        return self.cx.execute("SELECT * FROM campaigns LIMIT 1").fetchone()
+
+    def complete_campaign(self):
+        with self.cx:
+            self.cx.execute("UPDATE campaigns SET completed_ms=? WHERE completed_ms IS NULL", (now_ms(),))
+
+    def active_followups(self, current: int) -> int:
+        return self.cx.execute("""SELECT
+          (SELECT COUNT(*) FROM signals WHERE signal_ms<=? AND signal_ms+?>=?) +
+          (SELECT COUNT(*) FROM exploratory_triggers WHERE trigger_ms<=? AND trigger_ms+?>=?)""",
+          (current, FOLLOWUP_MS, current, current, FOLLOWUP_MS, current)).fetchone()[0]
+
+    def finish_run(self, run_id: int):
+        with self.cx:
+            self.cx.execute("UPDATE runs SET ended_ms=? WHERE id=?", (now_ms(), run_id))
+
+    def cycle_start(self, run_id: int, phase: str = "discovery") -> int:
+        with self.cx:
+            return self.cx.execute("INSERT INTO cycles(run_id,started_ms,phase) VALUES (?,?,?)",
+                                   (run_id, now_ms(), phase)).lastrowid
+
+    def cycle_finish(self, cid: int, eligible: int, assigned: int, sampled: int,
+                     skipped: int, failed: int, signals: int, mature_borrowed: int = 0,
+                     waiting: int = 0, admitted_new: int = 0, active_windows: int = 0):
+        with self.cx:
+            self.cx.execute("""UPDATE cycles SET finished_ms=?, eligible=?, assigned=?,
+                sampled=?, capacity_skips=?, api_failed_slots=?, signals_new=?,
+                mature_borrowed_slots=?,waiting_admission=?,new_admissions=?,active_windows=? WHERE id=?""",
+                (now_ms(), eligible, assigned, sampled, skipped, failed, signals, mature_borrowed,
+                 waiting, admitted_new, active_windows, cid))
+
+    def http_log(self, provider: str, endpoint: str, start: int, end: int,
+                 status: Optional[int], data: Optional[bytes], error: Optional[str], retry: int) -> int:
+        with self.cx:
+            return self.cx.execute("""INSERT INTO api_calls(provider,endpoint,requested_ms,
+                responded_ms,http_status,ok,error,retry_number,payload_sha256,payload_zlib)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (provider, endpoint, start, end, status, int(error is None), error, retry,
+                 sha(data) if data is not None else None,
+                 zlib.compress(data, 6) if data is not None else None)).lastrowid
+
+    def event(self, level: str, category: str, detail: str):
+        fn = LOG.error if level == "error" else LOG.warning
+        fn("%s | %s", category, detail)
+        with self.cx:
+            self.cx.execute("INSERT INTO operational_events(observed_ms,level,category,detail) VALUES (?,?,?,?)",
+                            (now_ms(), level, category, detail[:1500]))
+
+    def pool(self, addr: str, observed: int, created: Optional[int] = None,
+             dex_id: Optional[str] = None, base: Optional[str] = None,
+             symbol: Optional[str] = None, quote: Optional[str] = None):
+        a = address(addr)
+        if not a:
+            return
+        with self.cx:
+            self.cx.execute("""INSERT INTO pools(pool_key,address,first_seen_ms,created_ms,
+               dex_id,base_token,base_symbol,quote_token) VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(pool_key) DO UPDATE SET
+               created_ms=COALESCE(pools.created_ms,excluded.created_ms),
+               dex_id=COALESCE(pools.dex_id,excluded.dex_id),
+               base_token=COALESCE(pools.base_token,excluded.base_token),
+               base_symbol=COALESCE(pools.base_symbol,excluded.base_symbol),
+               quote_token=COALESCE(pools.quote_token,excluded.quote_token)""",
+               (key(a), a, observed, created, dex_id, address(base) or None,
+                symbol, address(quote) or None))
+
+    def discovery(self, source: str, kind: str, addr: str, rank: int, observed: int,
+                  call_id: Optional[int], raw: Any):
+        a = address(addr)
+        if not a:
+            return
+        with self.cx:
+            self.cx.execute("""INSERT INTO discoveries(observed_ms,source,kind,item_key,
+                rank,api_call_id,raw_json) VALUES (?,?,?,?,?,?,?)""",
+                (observed, source, kind, key(a), rank, call_id, canon(raw)))
+            if kind == "token":
+                self.cx.execute("INSERT OR IGNORE INTO tokens(token_key,address,first_seen_ms) VALUES (?,?,?)",
+                                (key(a), a, observed))
+            else:
+                self.cx.execute("""INSERT INTO memberships(pool_key,source,first_seen_ms,last_seen_ms,
+                     first_rank,first_call_id) VALUES (?,?,?,?,?,?)
+                     ON CONFLICT(pool_key,source) DO UPDATE SET last_seen_ms=excluded.last_seen_ms""",
+                     (key(a), source, observed, observed, rank, call_id))
+
+    def token_pending(self, current: int, limit: int = 30):
+        return self.cx.execute("""SELECT * FROM tokens
+            WHERE last_resolved_ms IS NULL OR
+            (resolved_pairs=0 AND last_resolved_ms<?) OR
+            (resolved_pairs>0 AND last_resolved_ms<?)
+            ORDER BY (last_resolved_ms IS NOT NULL), first_seen_ms,token_key LIMIT ?""",
+            (current - 600_000, current - 1_800_000, limit)).fetchall()
+
+    def token_resolved(self, addr: str, at: int, count: int):
+        with self.cx:
+            self.cx.execute("UPDATE tokens SET last_resolved_ms=?,resolved_pairs=? WHERE token_key=?",
+                            (at, count, key(addr)))
+
+    def membership_sources(self, poolkey: str) -> list[str]:
+        return [r[0] for r in self.cx.execute("SELECT source FROM memberships WHERE pool_key=? ORDER BY source",
+                                            (poolkey,)).fetchall()]
+
+    def pool_universe(self):
+        # Source first-seen is an observed, immutable cohort entrance time;
+        # provider rankings and quotes never define whether a pool is eligible.
+        return self.cx.execute("""SELECT p.*, s.id AS signal_id, s.signal_ms,
+            e.id AS exploration_id, e.trigger_ms,
+            t.first_seen_ms AS first_trending_ms
+            FROM pools p
+            LEFT JOIN signals s ON p.pool_key=s.pool_key
+            LEFT JOIN exploratory_triggers e ON p.pool_key=e.pool_key
+            LEFT JOIN memberships t ON p.pool_key=t.pool_key
+                AND t.source='gecko_trending_5m'
+            ORDER BY p.pool_key""").fetchall()
+
+    def pool_cohort(self, p: sqlite3.Row, current: int) -> tuple[str, str]:
+        # C: priority followups, no selection on future outcomes.
+        if p["signal_id"] is not None and p["signal_ms"] <= current <= p["signal_ms"] + FOLLOWUP_MS:
+            return "paper_followup", "active_official_signal"
+        if p["exploration_id"] is not None and p["trigger_ms"] <= current <= p["trigger_ms"] + FOLLOWUP_MS:
+            return "mature_followup", "active_exploratory_trigger"
+        if p["signal_id"] is not None or p["exploration_id"] is not None:
+            return "inactive", "followup_horizon_elapsed"
+        created = p["created_ms"]
+        # Unknown age cannot create an official signal, but is retained briefly
+        # so DexScreener can resolve a verified creation timestamp.
+        if created is None and current <= p["first_seen_ms"] + FOLLOWUP_MS:
+            return "age_unknown", "created_at_unresolved"
+        if created is not None and created <= current <= created + FOLLOWUP_MS:
+            return "young", "age_within_frozen_24h_window"
+        trending = p["first_trending_ms"]
+        if (created is not None and current > created + FOLLOWUP_MS
+                and trending is not None
+                and trending <= current <= trending + FOLLOWUP_MS):
+            return "mature_trending", "within_first_trending_watch_window"
+        if trending is not None and current > trending + FOLLOWUP_MS:
+            return "inactive", "mature_watch_window_elapsed"
+        if created is None:
+            return "inactive", "creation_time_unresolved_watch_elapsed"
+        return "inactive", "outside_eligible_young_or_mature_cohorts"
+
+    def eligible_pools(self, current: int):
+        return [p for p in self.pool_universe()
+                if self.pool_cohort(p, current)[0] != "inactive"]
+
+    def ineligible_pools(self, current: int, universe=None):
+        # Record the first exclusion once rather than writing old pools into
+        # every cycle. One SQL read for previously excluded keys.
+        excluded = {r[0] for r in self.cx.execute(
+            "SELECT DISTINCT pool_key FROM assignments WHERE disposition='temporarily_ineligible'")}
+        return [(p, why) for p in (self.pool_universe() if universe is None else universe)
+                for cohort, why in [self.pool_cohort(p, current)]
+                if cohort == "inactive" and p["pool_key"] not in excluded]
+
+    def _candidate_event(self, poolkey: str, cohort: str, at: int, cycle_id: Optional[int],
+                         old: Optional[str], new: str, why: str):
+        self.cx.execute("""INSERT INTO candidate_events
+           (pool_key,cohort,occurred_ms,cycle_id,old_state,new_state,reason)
+           VALUES (?,?,?,?,?,?,?)""", (poolkey, cohort, at, cycle_id, old, new, why))
+
+    def _candidate_set(self, poolkey: str, cohort: str, at: int,
+                       state: str, reason: str, cycle_id: Optional[int] = None):
+        old = self.cx.execute("SELECT state FROM candidate_windows WHERE pool_key=? AND cohort=?",
+                              (poolkey, cohort)).fetchone()
+        if old is None or old[0] == state:
+            return
+        self.cx.execute("""UPDATE candidate_windows SET state=?,reason=?,
+             closed_ms=CASE WHEN ? IN ('not_admitted_capacity','not_admitted_late',
+                  'watch_completed_no_signal','observation_incomplete','closed')
+               THEN ? ELSE closed_ms END
+             WHERE pool_key=? AND cohort=?""",
+             (state, reason, state, at, poolkey, cohort))
+        self._candidate_event(poolkey, cohort, at, cycle_id, old[0], state, reason)
+
+    def refresh_candidates(self, universe: list[sqlite3.Row], current: int,
+                           cfg: Config, cycle_id: Optional[int] = None):
+        """Record all actually eligible candidates, then advance persistent states.
+
+        Admission origins are as-of discovery timestamps; never derive eligibility
+        from a subsequent price. Unclassified pools remain visible in `pools`.
+        All changes are in the SAME prospective SQLite database only.
+        """
+        with self.cx:
+            existing_keys={(r[0],r[1]) for r in self.cx.execute(
+                'SELECT pool_key,cohort FROM candidate_windows')}
+            for p in universe:
+                cohort, _ = self.pool_cohort(p, current)
+                if cohort in ('young', 'age_unknown'):
+                    cat = 'young'
+                    origin = p['first_seen_ms']
+                    span = cfg.young_window_s * 1000
+                elif cohort == 'mature_trending':
+                    cat = 'mature_trending'
+                    origin = p['first_trending_ms']
+                    span = cfg.mature_window_s * 1000
+                else:
+                    cat = None
+                if cat and origin is not None:
+                    end = origin + span
+                    deadline = end - cfg.admission_warmup_s * 1000
+                    score = sha(f"{cfg.seed}|{cat}|{p['pool_key']}".encode())
+                    if (p['pool_key'],cat) not in existing_keys:
+                        state = 'queued' if current <= deadline else 'not_admitted_late'
+                        self.cx.execute("""INSERT INTO candidate_windows
+                          (pool_key,cohort,origin_ms,window_end_ms,admission_deadline_ms,
+                           seed_rank,state,first_candidate_ms,closed_ms,reason)
+                          VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                          (p['pool_key'],cat,origin,end,deadline,score,state,current,
+                           current if state != 'queued' else None,
+                           'eligible_discovered' if state == 'queued' else 'insufficient_remaining_window'))
+                        existing_keys.add((p['pool_key'],cat))
+                        self._candidate_event(p['pool_key'], cat, current, cycle_id, None, state,
+                                              'first_eligible_discovery' if state == 'queued'
+                                              else 'discovered_after_admission_deadline')
+            indexed={p['pool_key']:p for p in universe}
+            rows = self.cx.execute("""SELECT w.*, s.signal_ms, e.trigger_ms FROM candidate_windows w
+                LEFT JOIN signals s ON s.pool_key=w.pool_key
+                LEFT JOIN exploratory_triggers e ON e.pool_key=w.pool_key
+                WHERE w.state NOT IN ('not_admitted_capacity','not_admitted_late',
+                    'watch_completed_no_signal','observation_incomplete','closed')""").fetchall()
+            for w in rows:
+                poolkey, cat, state = w['pool_key'], w['cohort'], w['state']
+                signal_at = w['signal_ms'] if cat == 'young' else w['trigger_ms']
+                if signal_at is not None:
+                    if current <= signal_at + FOLLOWUP_MS:
+                        if state != 'signal_followup':
+                            self._candidate_set(poolkey, cat, current, 'signal_followup',
+                                                'immutable_signal_requires_24h_followup', cycle_id)
+                    else:
+                        self._candidate_set(poolkey, cat, current, 'closed',
+                                            'signal_followup_horizon_elapsed', cycle_id)
+                    continue
+                if state == 'queued' and current > w['admission_deadline_ms']:
+                    self._candidate_set(poolkey, cat, current, 'not_admitted_capacity',
+                                        'queue_wait_exceeded_fixed_admission_deadline', cycle_id)
+                elif state in ('admitted','observing','baseline_ready') and current <= w['window_end_ms']:
+                    p=indexed.get(poolkey)
+                    if p is not None:
+                        actual,_=self.pool_cohort(p,current)
+                        expected=('young','age_unknown') if cat=='young' else ('mature_trending',)
+                        if actual not in expected:
+                            self._candidate_set(poolkey,cat,current,'observation_incomplete',
+                                                'cohort_eligibility_changed_during_watch',cycle_id)
+                elif state in ('admitted','observing','baseline_ready') and current > w['window_end_ms']:
+                    # Do not claim an unobserved/failed window was a negative signal.
+                    good = (w['sample_count'] > 0 and w['baseline_reached'] == 1 and
+                            w['bad_quote_count'] == 0 and w['failed_slot_count'] == 0)
+                    snapshots = self.cx.execute("""SELECT observed_ms FROM snapshots
+                       WHERE pool_key=? AND observed_ms BETWEEN ? AND ?
+                       AND status='ok' AND price_usd>0 ORDER BY observed_ms""",
+                       (poolkey,w['admitted_ms'],w['window_end_ms'])).fetchall()
+                    points = [r[0] for r in snapshots]
+                    # Gaps measured between admission/quotes/window end, allowing
+                    # 2.5 * intended cadence; downtime is NOT filled synthetically.
+                    times = [w['admitted_ms']] + points + [w['window_end_ms']]
+                    gap_limit = cfg.followup_gap_factor * cfg.interval * 1000
+                    gaps_ok = all(b-a <= gap_limit for a,b in zip(times,times[1:]))
+                    terminal = 'watch_completed_no_signal' if good and gaps_ok else 'observation_incomplete'
+                    self._candidate_set(poolkey, cat, current, terminal,
+                                        'fixed_window_elapsed_complete' if good and gaps_ok
+                                        else 'window_elapsed_with_missing_or_inadequate_observation', cycle_id)
+
+    def close_discovery_windows(self, at: int, cfg: Config):
+        """End candidate-only watches when prospective discovery stops.
+
+        A candidate whose precommitted 30m/15m watch is cut short is CENSORED;
+        it is never silently declared a non-accelerating pool. Signals remain
+        protected for their full 24h horizon by the separate followup tables.
+        """
+        with self.cx:
+            rows=self.cx.execute("""SELECT * FROM candidate_windows WHERE state IN
+              ('queued','admitted','observing','baseline_ready')""").fetchall()
+            for w in rows:
+                has_signal=(self.prior_signal(w['pool_key']) if w['cohort']=='young'
+                            else self.prior_exploration(w['pool_key']))
+                if has_signal is not None:
+                    self._candidate_set(w['pool_key'],w['cohort'],at,'signal_followup',
+                                        'immutable_signal_preserved_after_discovery_end')
+                    continue
+                if w['state']=='queued':
+                    self._candidate_set(w['pool_key'],w['cohort'],at,'not_admitted_campaign_end',
+                                        'discovery_horizon_closed_before_admission')
+                elif at < w['window_end_ms']:
+                    self._candidate_set(w['pool_key'],w['cohort'],at,'observation_incomplete',
+                                        'candidate_watch_right_censored_at_campaign_end')
+                else:
+                    # If window expired while offline or just before drain,
+                    # let the normal completeness checker make the assessment.
+                    pool=self.cx.execute("""SELECT p.*,s.id AS signal_id,s.signal_ms,
+                        e.id AS exploration_id,e.trigger_ms,t.first_seen_ms AS first_trending_ms
+                        FROM pools p LEFT JOIN signals s ON s.pool_key=p.pool_key
+                        LEFT JOIN exploratory_triggers e ON e.pool_key=p.pool_key
+                        LEFT JOIN memberships t ON t.pool_key=p.pool_key
+                        AND t.source='gecko_trending_5m' WHERE p.pool_key=?""",
+                        (w['pool_key'],)).fetchone()
+                    if pool:
+                        self.refresh_candidates([pool],at,cfg)
+
+    def admit_candidate(self, row: sqlite3.Row, current: int, cycle_id: Optional[int]):
+        with self.cx:
+            self.cx.execute("""UPDATE candidate_windows SET state='admitted',admitted_ms=?,
+                reason='capacity_allocated_fixed_watch' WHERE pool_key=? AND cohort=? AND state='queued'""",
+                (current,row['pool_key'],row['cohort']))
+            self._candidate_event(row['pool_key'],row['cohort'],current,cycle_id,'queued',
+                                  'admitted','frozen_seed_fifo_capacity_allocation')
+
+    def update_candidate_sample(self, poolkey: str, at: int, snap: Optional[sqlite3.Row],
+                                baseline: Optional[sqlite3.Row], failed: bool = False):
+        with self.cx:
+            row = self.cx.execute("""SELECT * FROM candidate_windows WHERE pool_key=?
+                 AND state IN ('admitted','observing','baseline_ready')
+                 AND admitted_ms<=? AND window_end_ms>=?
+                 ORDER BY admitted_ms DESC LIMIT 1""", (poolkey,at,at)).fetchone()
+            if not row:
+                return
+            if failed:
+                self.cx.execute("""UPDATE candidate_windows SET failed_slot_count=failed_slot_count+1
+                    WHERE pool_key=? AND cohort=?""", (poolkey,row['cohort']))
+                return
+            new_state = 'baseline_ready' if baseline is not None else 'observing'
+            if row['state']=='baseline_ready':
+                new_state='baseline_ready'
+            self.cx.execute("""UPDATE candidate_windows SET sample_count=sample_count+1,
+                first_sample_ms=COALESCE(first_sample_ms,?),last_sample_ms=?,
+                bad_quote_count=bad_quote_count+?,
+                baseline_reached=MAX(baseline_reached,?),state=?
+                WHERE pool_key=? AND cohort=?""",
+                (at,at,int(snap is None or snap['status']!='ok'),
+                 int(baseline is not None),new_state,poolkey,row['cohort']))
+            if row['state'] != new_state:
+                self._candidate_event(poolkey,row['cohort'],at,None,row['state'],new_state,
+                                      'snapshot_baseline_valid' if baseline else 'observed_quote')
+
+    def _coverage_clock_ms(self) -> int:
+        """Use immutable database events, NEVER report invocation time.
+
+        A disconnected/finished campaign must not gain hypothetical missing
+        minutes simply because somebody reads the database a day later.
+        """
+        choices = []
+        for sql in (
+            "SELECT MAX(COALESCE(finished_ms,started_ms)) FROM cycles",
+            "SELECT MAX(occurred_ms) FROM candidate_events",
+            "SELECT MAX(observed_ms) FROM snapshots",
+            "SELECT MAX(completed_ms) FROM campaigns",
+        ):
+            item = self.cx.execute(sql).fetchone()[0]
+            if item is not None:
+                choices.append(item)
+        return max(choices) if choices else now_ms()
+
+    @staticmethod
+    def _candidate_end(w: sqlite3.Row, asof_ms: int, signal_ms: Optional[int]) -> int:
+        end = min(asof_ms, w['window_end_ms'])
+        if signal_ms is not None:
+            end = min(end, signal_ms)
+        # A terminal lease has an irrevocable frozen observation cutoff.
+        # A closed candidate cannot accumulate theoretical missed minutes.
+        if w['state'] in ('observation_incomplete', 'watch_completed_no_signal',
+                          'not_admitted_capacity', 'not_admitted_late',
+                          'not_admitted_campaign_end', 'closed') and w['closed_ms'] is not None:
+            end = min(end, w['closed_ms'])
+        return max(w['admitted_ms'], end)
+
+    def _coverage_data(self, windows: list[sqlite3.Row]) -> dict:
+        """As-of accounting. Three separate denominators; no price imputation.
+
+        (1) Assigned cycles / selection opportunities in *recorded* cycles,
+        (2) observed priced snapshots / actual sampled assignments,
+        (3) cadence approximation based on frozen lease duration.
+        The selected-cycle denominator is NOT a guarantee that all expected
+        minute-long cycles occurred: downtime must be audited separately.
+        """
+        asof_ms = self._coverage_clock_ms()
+        cfgrow = self.cx.execute('SELECT config_json FROM runs ORDER BY id LIMIT 1').fetchone()
+        cfgdata = json.loads(cfgrow[0]) if cfgrow else {}
+        interval_ms = max(1, int(cfgdata.get('interval', 60))) * 1000
+        sig = {r[0]:r[1] for r in self.cx.execute('SELECT pool_key,signal_ms FROM signals')}
+        explor = {r[0]:r[1] for r in self.cx.execute('SELECT pool_key,trigger_ms FROM exploratory_triggers')}
+        # The first assignment timestamp approximates each persisted selection
+        # instant; fallback to cycle start only when that cycle has no assignments.
+        cycle_starts = sorted(r[0] for r in self.cx.execute("""
+            SELECT COALESCE(MIN(a.assigned_ms),c.started_ms)
+            FROM cycles c LEFT JOIN assignments a ON a.cycle_id=c.id
+            WHERE c.phase='discovery' GROUP BY c.id"""))
+        by_key = {}
+        group = {}
+        for cohort in ('young', 'mature_trending'):
+            group[cohort] = {
+                'window_count_admitted':0, 'expected_opportunities_in_recorded_cycles':0,
+                'assigned_observation_slots':0, 'sampled_assignments':0,
+                'valid_priced_assignments':0, 'bad_quote_assignments':0,
+                'api_failed_assignments':0, 'capacity_skipped_assignments':0,
+                'other_or_pending_assignments':0, 'valid_priced_inside_watch':0,
+                'sampled_but_response_after_watch':0, 'recorded_cycles_per_window_below_assigned':0,
+                'frozen_cadence_mean_of_admitted':None,
+                'frozen_cadence_denominator_slots':0,
+                'candidate_sample_count_persisted':0,
+            }
+            ratios=[]
+            for w in (r for r in windows if r['cohort']==cohort and r['admitted_ms'] is not None):
+                terminal=(sig if cohort=='young' else explor).get(w['pool_key'])
+                end=self._candidate_end(w,asof_ms,terminal)
+                theoretical=max(1, int(max(0,end-w['admitted_ms'])//interval_ms)+1)
+                observed=w['sample_count']
+                ratios.append(min(1.0,observed/theoretical))
+                exp=bisect_right(cycle_starts,end)-bisect_left(cycle_starts,w['admitted_ms'])
+                g=group[cohort]
+                g['window_count_admitted']+=1
+                g['expected_opportunities_in_recorded_cycles']+=exp
+                g['frozen_cadence_denominator_slots']+=theoretical
+                g['candidate_sample_count_persisted']+=observed
+                by_key[(w['pool_key'],cohort)]=(w,end,exp)
+            group[cohort]['frozen_cadence_mean_of_admitted']=(
+                round(sum(ratios)/len(ratios),4) if ratios else None)
+
+        for a in self.cx.execute("""SELECT a.pool_key,a.stratum,a.assigned_ms,
+                        a.disposition,s.status AS snap_status,s.price_usd,s.observed_ms
+                 FROM assignments a JOIN cycles c ON c.id=a.cycle_id
+                 LEFT JOIN snapshots s ON s.id=a.snapshot_id
+                 WHERE c.phase='discovery' AND a.stratum IN ('young_window','mature_trending')"""):
+            cohort='young' if a['stratum']=='young_window' else 'mature_trending'
+            entry=by_key.get((a['pool_key'],cohort))
+            if entry is None:
+                continue
+            w,end,_=entry
+            if not (w['admitted_ms']<=a['assigned_ms']<=end):
+                continue
+            g=group[cohort]
+            g['assigned_observation_slots']+=1
+            disposition=a['disposition']
+            if disposition=='sampled':
+                g['sampled_assignments']+=1
+                if a['snap_status']=='ok' and a['price_usd'] is not None and a['price_usd']>0:
+                    g['valid_priced_assignments']+=1
+                    if a['observed_ms'] is not None and a['observed_ms']<=w['window_end_ms']:
+                        g['valid_priced_inside_watch']+=1
+                else:
+                    g['bad_quote_assignments']+=1
+                if a['observed_ms'] is not None and a['observed_ms']>w['window_end_ms']:
+                    g['sampled_but_response_after_watch']+=1
+            elif disposition=='api_failure':
+                g['api_failed_assignments']+=1
+            elif disposition=='skipped_capacity':
+                g['capacity_skipped_assignments']+=1
+            else:
+                g['other_or_pending_assignments']+=1
+
+        for cohort,g in group.items():
+            expected=g['expected_opportunities_in_recorded_cycles']
+            assigned=g['assigned_observation_slots']
+            sampled=g['sampled_assignments']
+            g['unassigned_recorded_cycle_slots']=max(0,expected-assigned)
+            g['excess_assignments_vs_expected']=max(0,assigned-expected)
+            g['assigned_fraction_of_recorded_cycle_opportunities']=(
+                round(assigned/expected,4) if expected else None)
+            g['sampled_fraction_of_recorded_cycle_opportunities']=(
+                round(sampled/expected,4) if expected else None)
+            g['valid_price_fraction_of_sampled_assignments']=(
+                round(g['valid_priced_assignments']/sampled,4) if sampled else None)
+            g['valid_price_fraction_of_recorded_cycle_opportunities']=(
+                round(g['valid_priced_assignments']/expected,4) if expected else None)
+        return {'asof_utc':iso(asof_ms),
+                'denominator_note':('Recorded-cycle coverage excludes cycles that never ran; '
+                                    'theoretical cadence is approximate, administrative '
+                                    'censoring freezes closed_ms; valid quotes include '
+                                    'post-window API responses but those cannot signal.'),
+                'cohorts':group}
+
+    def _outside_window_decisions(self) -> dict:
+        """Reason audit for provider responses that did NOT authorize a signal."""
+        campaign=self.cx.execute('SELECT discovery_end_ms FROM campaigns ORDER BY id DESC LIMIT 1').fetchone()
+        cutoff=campaign[0] if campaign else None
+        breakdown=Counter()
+        for r in self.cx.execute("""SELECT s.observed_ms,c.phase,c.id AS cycle_id,
+                  w.admitted_ms,w.window_end_ms
+                  FROM filter_decisions f JOIN snapshots s ON s.id=f.snapshot_id
+                  LEFT JOIN assignments a ON a.snapshot_id=s.id
+                  LEFT JOIN cycles c ON c.id=a.cycle_id
+                  LEFT JOIN candidate_windows w ON w.pool_key=s.pool_key AND
+                       w.cohort=CASE a.stratum
+                         WHEN 'young_window' THEN 'young'
+                         WHEN 'mature_trending' THEN 'mature_trending'
+                         ELSE NULL END
+                  WHERE f.cohort='followup_or_outside_watch'"""):
+            if r['cycle_id'] is None:
+                reason='missing_assignment_or_cycle_link'
+            elif r['phase'] != 'discovery':
+                reason='followup_phase'
+            elif cutoff is not None and r['observed_ms']>cutoff:
+                reason='response_after_campaign_discovery_end'
+            elif r['admitted_ms'] is None:
+                reason='no_matching_admitted_window'
+            elif r['observed_ms']<r['admitted_ms']:
+                reason='response_before_admission'
+            elif r['observed_ms']>r['window_end_ms']:
+                reason='response_after_fixed_window_end'
+            else:
+                reason='other_eligibility_guard_not_determined'
+            breakdown[reason]+=1
+        return {'total':sum(breakdown.values()), 'reasons':dict(sorted(breakdown.items())),
+                'warning':('These responses do not create retroactive signals. '
+                           'The other_eligibility_guard category is not inferred further.')}
+
+    def candidate_report(self) -> dict:
+        """Population, stable denominators and terminal cause breakdowns.
+
+        Never treat unobserved candidates as negatives. The original V0.2.3
+        continuity metric is retained by name for consumers, but its value
+        now uses a frozen observation cutoff and MUST NOT be interpreted as
+        either execution coverage or valid quote coverage.
+        """
+        rows=self.cx.execute('SELECT * FROM candidate_windows').fetchall()
+        known={r['pool_key'] for r in rows}
+        discovered=self.cx.execute('SELECT COUNT(*) FROM pools').fetchone()[0]
+        coverage=self._coverage_data(rows)
+        result={'discovered_pool_keys':discovered,
+                'without_classifiable_eligible_window':discovered-len(known),
+                'population_warning':'Gecko provider top pages only; not a chain-wide random census',
+                'coverage_asof_utc':coverage['asof_utc'],
+                'coverage_denominator_note':coverage['denominator_note'],
+                'cohorts':{}}
+        for cohort in ('young','mature_trending'):
+            subset=[w for w in rows if w['cohort']==cohort]
+            counts=dict(Counter(w['state'] for w in subset))
+            admitted=[w for w in subset if w['admitted_ms'] is not None]
+            reasons=Counter((w['state'], w['reason'] or 'unknown') for w in subset)
+            reason_summary={}
+            for (state,why),count in sorted(reasons.items()):
+                reason_summary.setdefault(state,{})[why]=count
+            censored=sum(w['state']=='observation_incomplete' and
+                         w['reason']=='candidate_watch_right_censored_at_campaign_end'
+                         for w in subset)
+            inadequate=sum(w['state']=='observation_incomplete' and
+                           w['reason']=='window_elapsed_with_missing_or_inadequate_observation'
+                           for w in subset)
+            other_incomplete=sum(w['state']=='observation_incomplete' for w in subset)-censored-inadequate
+            cov=coverage['cohorts'][cohort]
+            result['cohorts'][cohort]={
+                'eligible_window_candidates':len(subset),
+                'admitted':len(admitted),
+                'never_admitted':len(subset)-len(admitted),
+                'admission_fraction':round(len(admitted)/len(subset),4) if subset else None,
+                'states':counts, 'states_by_reason':reason_summary,
+                'incomplete_breakdown':{
+                    'administratively_right_censored':censored,
+                    'missing_or_inadequate_observation':inadequate,
+                    'other_unresolved_incomplete':other_incomplete},
+                'no_baseline_among_admitted':sum(w['baseline_reached']==0 for w in admitted),
+                'continuity_approx_mean_of_admitted':cov['frozen_cadence_mean_of_admitted'],
+                'continuity_approx_warning':'Frozen duration approximation; see recorded_cycle_coverage.',
+                'observed_quote_slots':sum(w['sample_count'] for w in subset),
+                'failed_api_slots':sum(w['failed_slot_count'] for w in subset),
+                'bad_quote_slots':sum(w['bad_quote_count'] for w in subset),
+                'recorded_cycle_coverage':cov,
+            }
+        return result
+
+    def assignment(self, cid: int, poolkey: str, stratum: str, rank: int,
+                   disposition: str, reason: Optional[str], when: int):
+        with self.cx:
+            return self.cx.execute("""INSERT INTO assignments(cycle_id,pool_key,assigned_ms,
+              stratum,rank_in_stratum,disposition,reason)
+              VALUES (?,?,?,?,?,?,?)""",
+              (cid, poolkey, when, stratum, rank, disposition, reason)).lastrowid
+
+    def assignment_result(self, assignment_id: int, disposition: str,
+                          call_id: Optional[int], snapshot_id: Optional[int], reason: Optional[str]):
+        with self.cx:
+            self.cx.execute("UPDATE assignments SET disposition=?,api_call_id=?,snapshot_id=?,reason=? WHERE id=?",
+                            (disposition, call_id, snapshot_id, reason, assignment_id))
+
+    def last_snapshot(self, poolkey: str):
+        return self.cx.execute("SELECT * FROM snapshots WHERE pool_key=? ORDER BY observed_ms DESC,id DESC LIMIT 1",
+                               (poolkey,)).fetchone()
+
+    def baseline(self, poolkey: str, current: int, cfg: Config):
+        # Missing/unpriced snapshots AND any capacity/api_failure assignment invalidate
+        # an older candidate baseline. Avoid survivorship from skipped slots.
+        return self.cx.execute("""SELECT s.* FROM snapshots s WHERE s.pool_key=?
+            AND s.status='ok' AND s.price_usd>0
+            AND s.observed_ms BETWEEN ? AND ?
+            AND NOT EXISTS(SELECT 1 FROM snapshots q WHERE q.pool_key=s.pool_key
+                AND q.observed_ms>s.observed_ms AND q.observed_ms<? AND q.status<>'ok')
+            AND NOT EXISTS(SELECT 1 FROM assignments a WHERE a.pool_key=s.pool_key
+                AND a.assigned_ms>s.observed_ms AND a.assigned_ms<?
+                AND a.disposition IN ('skipped_capacity','api_failure'))
+            AND NOT EXISTS(SELECT 1 FROM runs r WHERE r.started_ms>s.observed_ms
+                AND r.started_ms<?)
+            ORDER BY s.observed_ms DESC,s.id DESC LIMIT 1""",
+            (poolkey, current - cfg.baseline_max_s * 1000,
+             current - cfg.baseline_min_s * 1000, current, current, current)).fetchone()
+
+    def snapshot(self, poolkey: str, current: int, call_id: Optional[int], pair: Optional[dict]):
+        if pair is None:
+            vals = ("missing", None, None, None, None, None, None, None)
+        else:
+            price = positive(pair.get("priceUsd"))
+            values = dictobj(pair.get("liquidity"))
+            vol = dictobj(pair.get("volume"))
+            txn = dictobj(dictobj(pair.get("txns")).get("m5"))
+            changes = dictobj(pair.get("priceChange"))
+            vals = ("ok" if price is not None else "unpriced", price,
+                    nonnegative(values.get("usd")), nonnegative(vol.get("m5")),
+                    natural_int(txn.get("buys")), natural_int(txn.get("sells")),
+                    numeric(changes.get("m5")), timestamp_ms(pair.get("pairCreatedAt")))
+        with self.cx:
+            cur = self.cx.execute("""INSERT OR IGNORE INTO snapshots(pool_key,observed_ms,
+                api_call_id,status,price_usd,liquidity_usd,volume_m5_usd,buys_m5,
+                sells_m5,change_m5_pct,pair_created_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (poolkey, current, call_id, *vals))
+            if cur.rowcount == 0:
+                return None
+            return self.cx.execute("SELECT * FROM snapshots WHERE id=?", (cur.lastrowid,)).fetchone()
+
+    def prior_signal(self, poolkey: str) -> Optional[sqlite3.Row]:
+        return self.cx.execute("SELECT * FROM signals WHERE pool_key=?", (poolkey,)).fetchone()
+
+    def prior_exploration(self, poolkey: str) -> Optional[sqlite3.Row]:
+        return self.cx.execute("SELECT * FROM exploratory_triggers WHERE pool_key=?", (poolkey,)).fetchone()
+
+    def record_filters(self, snap: sqlite3.Row, baseline: Optional[sqlite3.Row],
+                       pool: sqlite3.Row, cfg: Config, cohort: str = "young") -> tuple[bool, bool, Optional[float]]:
+        states, gain = evaluate(snap, baseline, pool, cfg)
+        official_old = self.prior_signal(pool["pool_key"]) is not None
+        explorer_old = self.prior_exploration(pool["pool_key"]) is not None
+        official = cohort == "young" and all(v == "pass" for v in states.values())
+        # The identical numerical thresholds are evaluated for a mature pool,
+        # but age is intentionally NOT passed/overridden and these are separate
+        # exploratory triggers, never counted as official paper signals.
+        # Baseline must itself have been observed after initial trending
+        # detection AND after the pool became mature. No pre-discovery gain.
+        trending = pool["first_trending_ms"]
+        mature_baseline = (baseline is not None and trending is not None
+                           and baseline["observed_ms"] >= trending
+                           and pool["created_ms"] is not None
+                           and baseline["observed_ms"] > pool["created_ms"] + FOLLOWUP_MS)
+        mature = (cohort == "mature_trending" and states["pool_age"] == "fail"
+                  and mature_baseline
+                  and all(v == "pass" for k, v in states.items() if k != "pool_age"))
+        with self.cx:
+            self.cx.execute("""INSERT INTO filter_decisions(snapshot_id,decided_ms,
+                rule_version,baseline_id,observed_gain_pct,states_json,reasons_json,
+                eligible,already_signaled,cohort,exploratory_eligible)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (snap["id"], snap["observed_ms"], RULE_VERSION,
+                 baseline["id"] if baseline else None, gain,
+                 canon(states), canon([k + ":" + v for k, v in states.items() if v != "pass"]),
+                 int(official), int(official_old or explorer_old), cohort, int(mature)))
+        return official and not official_old, mature and not explorer_old, gain
+
+    def exploratory_trigger(self, snap: sqlite3.Row, baseline: sqlite3.Row,
+                            pool: sqlite3.Row, gain: float, cfg: Config) -> Optional[int]:
+        # Separate from official signals, and only when mature age is verified.
+        trending = pool["first_trending_ms"]
+        if trending is None or snap["observed_ms"] < trending:
+            return None
+        with self.cx:
+            c = self.cx.execute("""INSERT OR IGNORE INTO exploratory_triggers
+                (pool_key,trigger_ms,snapshot_id,baseline_id,entry_usd,baseline_usd,
+                observed_gain_pct,first_trending_ms,source_memberships_json,
+                rule_version,config_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (pool["pool_key"], snap["observed_ms"], snap["id"], baseline["id"],
+                 snap["price_usd"], baseline["price_usd"], gain, trending,
+                 canon(self.membership_sources(pool["pool_key"])), RULE_VERSION, cfg.digest()))
+            if c.rowcount:
+                LOG.warning("MATURE EXPLORATORY TRIGGER %s observed=%s gain=%.3f%%",
+                            pool["pool_key"], iso(snap["observed_ms"]), gain)
+                return c.lastrowid
+        return None
+
+    def exploratory_followup(self, trigger_id: int, assignment_id: int,
+                             snap: Optional[sqlite3.Row], disposition: str):
+        with self.cx:
+            self.cx.execute("""INSERT OR IGNORE INTO exploratory_followups
+                (trigger_id,assignment_id,snapshot_id,observed_ms,status)
+                VALUES (?,?,?,?,?)""",
+                (trigger_id, assignment_id, snap["id"] if snap else None,
+                 snap["observed_ms"] if snap else None,
+                 snap["status"] if snap else disposition))
+
+    def signal(self, snap: sqlite3.Row, baseline: sqlite3.Row, pool: sqlite3.Row,
+               gain: float, cfg: Config) -> Optional[int]:
+        age = (snap["observed_ms"] - (snap["pair_created_ms"] or pool["created_ms"])) / 1000
+        with self.cx:
+            cur = self.cx.execute("""INSERT OR IGNORE INTO signals(pool_key,signal_ms,
+                snapshot_id,baseline_id,entry_usd,baseline_usd,observed_gain_pct,
+                pool_age_s,source_memberships_json,rule_version,config_hash)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (pool["pool_key"], snap["observed_ms"], snap["id"], baseline["id"],
+                 snap["price_usd"], baseline["price_usd"], gain, age,
+                 canon(self.membership_sources(pool["pool_key"])), RULE_VERSION, cfg.digest()))
+            if cur.rowcount:
+                LOG.warning("PAPER SIGNAL %s observed=%s gain=%.3f%% price=$%.9g",
+                            pool["pool_key"], iso(snap["observed_ms"]), gain, snap["price_usd"])
+                return cur.lastrowid
+        return None
+
+    def followup(self, signal_id: int, assignment_id: int, snap: Optional[sqlite3.Row],
+                 disposition: str):
+        with self.cx:
+            self.cx.execute("""INSERT INTO signal_followups(signal_id,assignment_id,snapshot_id,
+               observed_ms,status) VALUES (?,?,?,?,?)""",
+               (signal_id, assignment_id, snap["id"] if snap else None,
+                snap["observed_ms"] if snap else None,
+                snap["status"] if snap else disposition))
+
+    def risk(self, poolkey: str, kind: str, prev: Optional[sqlite3.Row],
+             snap: sqlite3.Row, a: Optional[float], b: Optional[float]):
+        # Limit to one event of each kind per five-minute incident. Subsequent
+        # observations can confirm persistence, but not independent corroboration.
+        active = self.cx.execute("""SELECT * FROM risk_events WHERE pool_key=? AND kind=?
+             AND first_observed_ms>=? ORDER BY first_observed_ms DESC LIMIT 1""",
+             (poolkey, kind, snap["observed_ms"] - 300_000)).fetchone()
+        if active:
+            return
+        delta = (b / a - 1) * 100 if a is not None and a > 0 and b is not None else None
+        evidence = {"method": "same_provider_snapshots", "provider": "DexScreener",
+                    "from_ms": prev["observed_ms"] if prev else None,
+                    "to_ms": snap["observed_ms"], "not_fraud_verdict": True}
+        with self.cx:
+            self.cx.execute("""INSERT OR IGNORE INTO risk_events(pool_key,kind,first_observed_ms,
+                reference_snapshot_id,event_snapshot_id,from_value,to_value,percent_change,
+                evidence_json) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (poolkey, kind, snap["observed_ms"], prev["id"] if prev else None,
+                 snap["id"], a, b, delta, canon(evidence)))
+        LOG.warning("RISK SUSPECTED %s %s from=%s to=%s", poolkey, kind, a, b)
+
+    def confirm_risks(self, poolkey: str, snap: sqlite3.Row):
+        events = self.cx.execute("""SELECT * FROM risk_events WHERE pool_key=?
+          AND status='suspected' AND first_observed_ms<? AND first_observed_ms>=?""",
+          (poolkey, snap["observed_ms"], snap["observed_ms"] - 900_000)).fetchall()
+        if snap["status"] != "ok":
+            return
+        for event in events:
+            kind, b, a = event["kind"], event["to_value"], event["from_value"]
+            if kind == "liquidity_crash_suspected":
+                persists = a is not None and a > 0 and snap["liquidity_usd"] is not None and snap["liquidity_usd"] <= a * 0.25
+            elif kind == "price_crash_observed":
+                persists = a is not None and a > 0 and snap["price_usd"] is not None and snap["price_usd"] <= a * 0.25
+            elif kind == "provider_5m_change_anomaly":
+                persists = snap["change_m5_pct"] is not None and snap["change_m5_pct"] <= -99.9
+            elif kind == "missing_quotes":
+                persists = False  # Recovery is not proof of a prolonged delisting.
+            else:
+                persists = False
+            if persists:
+                with self.cx:
+                    self.cx.execute("""INSERT OR IGNORE INTO risk_confirmations
+                      (risk_id,confirmed_observed_ms,snapshot_id,observation)
+                      VALUES (?,?,?,?)""",
+                      (event["id"], snap["observed_ms"], snap["id"],
+                       "same_provider_persistence_not_independent_verification"))
+                    self.cx.execute("UPDATE risk_events SET status='persistent',status_updated_ms=? WHERE id=?",
+                                    (snap["observed_ms"], event["id"]))
+
+    def evaluate_risk(self, snap: sqlite3.Row, previous: Optional[sqlite3.Row]):
+        self.confirm_risks(snap["pool_key"], snap)
+        if snap["status"] == "ok" and snap["change_m5_pct"] is not None and snap["change_m5_pct"] <= -99.9:
+            self.risk(snap["pool_key"], "provider_5m_change_anomaly", None,
+                      snap, None, snap["change_m5_pct"])
+        if previous is None:
+            return
+        if not 0 < snap["observed_ms"] - previous["observed_ms"] <= 180_000:
+            return
+        if snap["status"] != "ok" and previous["status"] != "ok":
+            self.risk(snap["pool_key"], "missing_quotes", previous, snap, None, None)
+        # Liquidity observations can remain valid even if the token has no
+        # usable USD price. Never fabricate a zero value from missing liquidity.
+        a, b = previous["liquidity_usd"], snap["liquidity_usd"]
+        if a is not None and a > 0 and b is not None and b <= a * 0.2:
+            self.risk(snap["pool_key"], "liquidity_crash_suspected", previous, snap, a, b)
+        if previous["status"] == "ok" and snap["status"] == "ok":
+            a, b = previous["price_usd"], snap["price_usd"]
+            if a is not None and a > 0 and b is not None and b <= a * 0.2:
+                self.risk(snap["pool_key"], "price_crash_observed", previous, snap, a, b)
+
+    def campaign_summary(self) -> Optional[dict]:
+        c = self.cx.execute("SELECT * FROM campaigns ORDER BY id LIMIT 1").fetchone()
+        if not c:
+            return None
+        return {"started_utc": iso(c["started_ms"]),
+                "discovery_end_utc": iso(c["discovery_end_ms"]),
+                "discovery_hours": c["discovery_hours"],
+                "completed_utc": iso(c["completed_ms"]) if c["completed_ms"] is not None else None,
+                "phase_now": "complete" if c["completed_ms"] is not None else
+                  ("drain" if now_ms() >= c["discovery_end_ms"] else "discovery")}
+
+    @staticmethod
+    def percentile(values: list[float], q: float) -> Optional[float]:
+        vals = sorted(values)
+        return round(vals[min(len(vals) - 1, int((len(vals) - 1) * q))], 3) if vals else None
+
+    def cohort_timing(self) -> dict:
+        """Provider-visible discovery -> own collection, by contemporaneous cohort.
+
+        SQL aggregates per pool: memory scales with pools, not with snapshots.
+        Provider publication lag and true opportunity age remain UNOBSERVED.
+        """
+        rows = self.cx.execute("""SELECT f.cohort, s.pool_key,
+             MIN(s.observed_ms) AS first_quote_ms,
+             MIN(CASE WHEN f.baseline_id IS NOT NULL THEN s.observed_ms END) AS ready_ms,
+             p.first_seen_ms, t.first_seen_ms AS trend_ms
+             FROM filter_decisions f JOIN snapshots s ON s.id=f.snapshot_id
+             JOIN pools p ON p.pool_key=s.pool_key
+             LEFT JOIN memberships t ON t.pool_key=s.pool_key AND t.source='gecko_trending_5m'
+             WHERE f.cohort IN ('young','mature_trending')
+               AND s.status='ok' AND s.price_usd>0
+             GROUP BY f.cohort,s.pool_key""").fetchall()
+        result = {}
+        for cohort in ("young", "mature_trending"):
+            picked = [r for r in rows if r["cohort"] == cohort]
+            lags, intervals, ready = [], [], []
+            for r in picked:
+                origin = r["trend_ms"] if cohort == "mature_trending" else r["first_seen_ms"]
+                if origin is None:
+                    continue
+                first = r["first_quote_ms"]
+                lags.append(max(0, (first - origin) / 1000))
+                second = self.cx.execute("""SELECT MIN(s.observed_ms) FROM snapshots s
+                     JOIN filter_decisions f ON f.snapshot_id=s.id
+                     WHERE s.pool_key=? AND f.cohort=? AND s.status='ok' AND s.price_usd>0 AND s.observed_ms>?""",
+                     (r["pool_key"], cohort, first)).fetchone()[0]
+                if second is not None:
+                    intervals.append((second - first) / 1000)
+                if r["ready_ms"] is not None:
+                    ready.append(max(0, (r["ready_ms"] - origin) / 1000))
+            result[cohort] = {
+                "distinct_pools_with_quotes": len(picked),
+                "first_quote_after_discovery_p50_s": self.percentile(lags, .5),
+                "first_quote_after_discovery_p95_s": self.percentile(lags, .95),
+                "first_to_second_quote_p50_s": self.percentile(intervals, .5),
+                "baseline_ready_after_discovery_p50_s": self.percentile(ready, .5),
+                "baseline_ready_after_discovery_p95_s": self.percentile(ready, .95),
+                "pools_reaching_baseline": len(ready),
+            }
+        return result
+
+    def signal_timing(self) -> dict:
+        """Decision timing, distinct from provider/API availability latency."""
+        result = {}
+        queries = {
+          "young": """SELECT s.signal_ms AS observed, p.first_seen_ms AS found,
+                        b.observed_ms AS baseline
+                      FROM signals s JOIN pools p ON p.pool_key=s.pool_key
+                      JOIN snapshots b ON b.id=s.baseline_id""",
+          "mature_trending": """SELECT s.trigger_ms AS observed, t.first_seen_ms AS found,
+                        b.observed_ms AS baseline
+                      FROM exploratory_triggers s
+                      JOIN memberships t ON t.pool_key=s.pool_key AND t.source='gecko_trending_5m'
+                      JOIN snapshots b ON b.id=s.baseline_id""",
+        }
+        for cohort, query in queries.items():
+            records = self.cx.execute(query).fetchall()
+            discovery_delay = [(r["observed"]-r["found"])/1000 for r in records]
+            baseline_delay = [(r["observed"]-r["baseline"])/1000 for r in records]
+            result[cohort] = {
+              "count": len(records),
+              "first_discovery_to_signal_p50_s": self.percentile(discovery_delay, .5),
+              "first_discovery_to_signal_p95_s": self.percentile(discovery_delay, .95),
+              "baseline_to_signal_p50_s": self.percentile(baseline_delay, .5),
+            }
+        return result
+
+    def followup_coverage(self, start_ms: int, snapshots: list[sqlite3.Row],
+                          current_ms: int, missing_slots: int = 0) -> dict:
+        """Observed-only coverage; explicitly preserve long downtime gaps.
+
+        2.5 * configured cadence is a preregistered diagnostic tolerance,
+        NOT an execution assumption or an imputation of unobserved prices.
+        """
+        config = self.cx.execute("SELECT config_json FROM runs ORDER BY id LIMIT 1").fetchone()
+        cfg = json.loads(config[0]) if config else {}
+        interval_ms = max(1, int(cfg.get("interval", 60))) * 1000
+        factor = float(cfg.get("followup_gap_factor", 2.5))
+        cutoff = max(start_ms, min(current_ms, start_ms + FOLLOWUP_MS))
+        priced = sorted({r["observed_ms"] for r in snapshots
+                         if r["status"] == "ok" and r["price_usd"] is not None
+                         and start_ms <= r["observed_ms"] <= cutoff})
+        points = [start_ms] + [t for t in priced if t > start_ms] + [cutoff]
+        gaps = [max(0, b-a) for a, b in zip(points, points[1:])]
+        long = [g for g in gaps if g > factor * interval_ms]
+        bad_quotes = sum(1 for r in snapshots if r["status"] != "ok" or r["price_usd"] is None)
+        expected = (cutoff - start_ms) // interval_ms + 1
+        continuity_ok = not long and not bad_quotes and not missing_slots
+        last_before_horizon = (priced[-1] if priced else None)
+        near_horizon = (cutoff >= start_ms + FOLLOWUP_MS
+                        and last_before_horizon is not None
+                        and last_before_horizon >= start_ms + FOLLOWUP_MS - interval_ms)
+        complete = bool(near_horizon and continuity_ok)
+        return {
+            "expected_observation_slots_approx": int(expected),
+            "priced_observation_slots": len(priced),
+            "coverage_fraction_approx": round(min(1.0, len(priced) / expected), 4) if expected else None,
+            "long_gap_count": len(long),
+            "max_unobserved_gap_s": round(max(gaps, default=0) / 1000, 2),
+            "missing_or_unpriced": bad_quotes,
+            "skipped_or_failed_followups": missing_slots,
+            "continuous_through_cutoff": continuity_ok,
+            "evaluable_24h": complete,
+        }
+
+    def summary(self) -> dict:
+        def ct(t: str) -> int:
+            return self.cx.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        return {
+            "version": VERSION, "runs": ct("runs"), "cycles": ct("cycles"),
+            "candidate_admissions": self.candidate_report(),
+            "outside_watch_decisions": self._outside_window_decisions(),
+            "new_admissions_total": self.cx.execute("SELECT COALESCE(SUM(new_admissions),0) FROM cycles").fetchone()[0],
+            "waiting_candidate_cycle_slots": self.cx.execute("SELECT COALESCE(SUM(waiting_admission),0) FROM cycles").fetchone()[0],
+            "pools": ct("pools"), "distinct_tokens_with_quotes": self.cx.execute(
+                "SELECT COUNT(DISTINCT base_token) FROM pools WHERE base_token IS NOT NULL").fetchone()[0],
+            "discoveries": ct("discoveries"), "memberships": ct("memberships"),
+            "api_attempts": ct("api_calls"), "api_errors": self.cx.execute(
+                "SELECT COUNT(*) FROM api_calls WHERE ok=0").fetchone()[0],
+            "snapshots": ct("snapshots"),
+            "snapshots_by_status": {r[0]: r[1] for r in self.cx.execute(
+                "SELECT status,COUNT(*) FROM snapshots GROUP BY status")},
+            "assignments_by_disposition": {r[0]: r[1] for r in self.cx.execute(
+                "SELECT disposition,COUNT(*) FROM assignments GROUP BY disposition")},
+            "signals": ct("signals"), "mature_exploratory_triggers": ct("exploratory_triggers"),
+            "risk_events": {r[0]: r[1] for r in self.cx.execute(
+                "SELECT kind,COUNT(*) FROM risk_events GROUP BY kind")},
+            "filters": {r[0]: (r[1], r[2], r[3]) for r in self.cx.execute("""
+                SELECT json_each.key,
+                 SUM(json_each.value='pass'),SUM(json_each.value='fail'),
+                 SUM(json_each.value='unknown')
+                FROM filter_decisions, json_each(filter_decisions.states_json)
+                GROUP BY json_each.key""")},
+            "api_latency_p50_ms": self.latency_quantile(.50),
+            "api_latency_p95_ms": self.latency_quantile(.95),
+            "campaign": self.campaign_summary(),
+            "cycles_by_phase": {r[0]: r[1] for r in self.cx.execute(
+                "SELECT phase,COUNT(*) FROM cycles GROUP BY phase")},
+            "mature_borrowed_slots": self.cx.execute(
+                "SELECT COALESCE(SUM(mature_borrowed_slots),0) FROM cycles").fetchone()[0],
+            "cohort_timing": self.cohort_timing(),
+            "signal_timing": self.signal_timing(),
+            "cycle_capacity_skips": self.cx.execute(
+                "SELECT COALESCE(SUM(capacity_skips),0) FROM cycles").fetchone()[0],
+            "cycle_api_failed_slots": self.cx.execute(
+                "SELECT COALESCE(SUM(api_failed_slots),0) FROM cycles").fetchone()[0],
+            "discovery_to_first_quote_p50_s": self.discovery_latency_quantile(.5),
+            "discovery_to_first_quote_p95_s": self.discovery_latency_quantile(.95),
+            "snapshot_cohort_counts": {r[0]: r[1] for r in self.cx.execute(
+                "SELECT cohort,COUNT(*) FROM filter_decisions GROUP BY cohort")},
+            "assignment_stratum_counts": {r[0]: r[1] for r in self.cx.execute(
+                "SELECT stratum,COUNT(*) FROM assignments GROUP BY stratum")},
+            "mature_followup_slots_missing_capacity_or_api": self.cx.execute("""SELECT COUNT(*)
+                FROM exploratory_followups WHERE status IN ('skipped_capacity','api_failure')""").fetchone()[0],
+            "source_membership_pool_counts": {r[0]:r[1] for r in self.cx.execute(
+                "SELECT source,COUNT(*) FROM memberships GROUP BY source")},
+            "last_snapshot_utc": iso(self.cx.execute(
+                "SELECT MAX(observed_ms) FROM snapshots").fetchone()[0]),
+            "followup_slots_missing_capacity_or_api": self.cx.execute("""SELECT COUNT(*)
+                FROM signal_followups WHERE status IN ('skipped_capacity','api_failure')""").fetchone()[0],
+        }
+
+    def latency_quantile(self, quantile: float):
+        rows = [r[0] for r in self.cx.execute(
+            "SELECT responded_ms-requested_ms FROM api_calls ORDER BY responded_ms-requested_ms")]
+        return rows[min(len(rows) - 1, int((len(rows) - 1) * quantile))] if rows else None
+
+    def discovery_latency_quantile(self, q: float):
+        # Observed discovery -> first DexScreener quote delay; NOT actual pool
+        # creation -> discovery lag, and NOT quote freshness or executable latency.
+        rows = sorted(max(0, (r[1] - r[0]) / 1000) for r in self.cx.execute("""
+            SELECT p.first_seen_ms, MIN(s.observed_ms) FROM pools p
+            JOIN snapshots s ON s.pool_key=p.pool_key
+            GROUP BY p.pool_key"""))
+        return rows[min(len(rows) - 1, int((len(rows) - 1) * q))] if rows else None
+
+    def signal_reports(self, current: Optional[int] = None):
+        current = now_ms() if current is None else current
+        signals = self.cx.execute("SELECT * FROM signals ORDER BY signal_ms").fetchall()
+        for s in signals:
+            snapshots = self.cx.execute("""SELECT * FROM snapshots WHERE pool_key=? AND
+                observed_ms>=? AND observed_ms<=? ORDER BY observed_ms""",
+                (s["pool_key"], s["signal_ms"], s["signal_ms"] + FOLLOWUP_MS)).fetchall()
+            good = [v for v in snapshots if v["status"] == "ok" and v["price_usd"] is not None]
+            returns = [100 * (v["price_usd"] / s["entry_usd"] - 1) for v in good]
+            times = [v["observed_ms"] for v in good]
+            peak_idx = returns.index(max(returns)) if returns else None
+            maxdd, peak = 0.0, s["entry_usd"]
+            for v in good:
+                peak = max(peak, v["price_usd"])
+                maxdd = min(maxdd, 100 * (v["price_usd"] / peak - 1))
+            missing = self.cx.execute("""SELECT COUNT(*) FROM assignments a
+                JOIN signal_followups f ON f.assignment_id=a.id
+                WHERE f.signal_id=? AND a.disposition IN ('skipped_capacity','api_failure')""",
+                (s["id"],)).fetchone()[0]
+            horizon = s["signal_ms"] + FOLLOWUP_MS
+            at_horizon = [v for v in good if horizon - 60_000 <= v["observed_ms"] <= horizon]
+            coverage = self.followup_coverage(s["signal_ms"], snapshots, current, missing)
+            if current < horizon:
+                maturity = "pending_right_censored_if_stopped_now"
+            elif coverage["evaluable_24h"]:
+                maturity = "horizon_observed_with_continuous_coverage"
+            elif at_horizon:
+                maturity = "horizon_observed_with_gaps"
+            else:
+                maturity = "horizon_unobserved_incomplete"
+            out = dict(s)
+            out.update({"signal_utc": iso(s["signal_ms"]), "observed_mfe_pct": max(returns) if returns else None,
+                        "observed_mae_pct": min(returns) if returns else None,
+                        "time_to_sampled_peak_s": (times[peak_idx] - s["signal_ms"]) / 1000 if peak_idx is not None else None,
+                        "observed_max_drawdown_pct": maxdd if good else None,
+                        "latest_sampled_return_pct": returns[-1] if returns else None,
+                        "last_sample_ms": times[-1] if times else None,
+                        "priced_samples": len(good), "missing_or_unpriced": len(snapshots) - len(good),
+                        "skipped_or_failed_followups": missing, "maturity": maturity,
+                        "observed_24h_return_pct": (100 * (at_horizon[-1]["price_usd"] / s["entry_usd"] - 1)) if at_horizon else None})
+            out.update(coverage)
+            yield out
+
+    def exploratory_reports(self, current: Optional[int] = None):
+        """Completely separate prospective outcome cohort (never included in signals)."""
+        current = now_ms() if current is None else current
+        for e in self.cx.execute("SELECT * FROM exploratory_triggers ORDER BY trigger_ms").fetchall():
+            horizon = e["trigger_ms"] + FOLLOWUP_MS
+            snaps = self.cx.execute("""SELECT * FROM snapshots WHERE pool_key=?
+                AND observed_ms BETWEEN ? AND ? ORDER BY observed_ms""",
+                (e["pool_key"], e["trigger_ms"], horizon)).fetchall()
+            good = [x for x in snaps if x["status"] == "ok" and x["price_usd"] is not None]
+            values = [100 * (x["price_usd"] / e["entry_usd"] - 1) for x in good]
+            peakidx = values.index(max(values)) if values else None
+            peak, maxdd = e["entry_usd"], 0.0
+            for x in good:
+                peak = max(peak, x["price_usd"])
+                maxdd = min(maxdd, 100 * (x["price_usd"] / peak - 1))
+            at_horizon = [x for x in good if horizon - 60_000 <= x["observed_ms"] <= horizon]
+            missing = self.cx.execute("""SELECT COUNT(*) FROM exploratory_followups
+                WHERE trigger_id=? AND status IN ('api_failure','skipped_capacity')""",
+                (e["id"],)).fetchone()[0]
+            coverage = self.followup_coverage(e["trigger_ms"], snaps, current, missing)
+            maturity = ("pending_right_censored_if_stopped_now" if current < horizon else
+                        "horizon_observed_with_continuous_coverage" if coverage["evaluable_24h"] else
+                        "horizon_observed_with_gaps" if at_horizon else
+                        "horizon_unobserved_incomplete")
+            out = dict(e)
+            out.update({"trigger_utc": iso(e["trigger_ms"]),
+                "observed_mfe_pct": max(values) if values else None,
+                "observed_mae_pct": min(values) if values else None,
+                "time_to_sampled_peak_s": (good[peakidx]["observed_ms"] - e["trigger_ms"]) / 1000 if peakidx is not None else None,
+                "observed_max_drawdown_pct": maxdd if good else None,
+                "priced_samples": len(good), "skipped_or_failed_followups": missing,
+                "maturity": maturity,
+                "observed_24h_return_pct": (100 * (at_horizon[-1]["price_usd"] / e["entry_usd"] - 1)) if at_horizon else None})
+            out.update(coverage)
+            yield out
+
+
+FILTERS = ("pool_age", "valid_price", "baseline", "observed_gain", "provider_m5_gain",
+           "liquidity", "volume_m5", "transactions_m5", "buy_sell_ratio")
+
+
+def evaluate(snap: sqlite3.Row, baseline: Optional[sqlite3.Row],
+             pool: sqlite3.Row, cfg: Config) -> tuple[dict[str, str], Optional[float]]:
+    f: dict[str, str] = {s: "unknown" for s in FILTERS}
+    created = snap["pair_created_ms"] or pool["created_ms"]
+    if created is not None:
+        age = (snap["observed_ms"] - created) / 1000
+        f["pool_age"] = "pass" if cfg.min_age_s <= age <= cfg.max_age_s else "fail"
+    f["valid_price"] = "pass" if snap["status"] == "ok" and snap["price_usd"] is not None else "unknown"
+    f["baseline"] = "pass" if baseline is not None else "unknown"
+    gain = None
+    if baseline is not None and snap["price_usd"] is not None and baseline["price_usd"] is not None and baseline["price_usd"] > 0:
+        gain = 100 * (snap["price_usd"] / baseline["price_usd"] - 1)
+        f["observed_gain"] = "pass" if gain >= cfg.min_observed_gain_pct else "fail"
+    thresholds = [("provider_m5_gain", "change_m5_pct", cfg.min_m5_gain_pct),
+                  ("liquidity", "liquidity_usd", cfg.min_liquidity_usd),
+                  ("volume_m5", "volume_m5_usd", cfg.min_volume_m5_usd)]
+    for name, column, threshold in thresholds:
+        v = snap[column]
+        if v is not None:
+            f[name] = "pass" if v >= threshold else "fail"
+    buys, sells = snap["buys_m5"], snap["sells_m5"]
+    if buys is not None and sells is not None:
+        f["transactions_m5"] = "pass" if buys + sells >= cfg.min_tx_m5 else "fail"
+        f["buy_sell_ratio"] = "pass" if buys >= cfg.min_buy_sell_ratio * max(1, sells) else "fail"
+    return f, gain
+
+
+class ApiFailure(Exception):
+    pass
+
+
+class RateBucket:
+    def __init__(self, budget_per_min: int):
+        self.budget = budget_per_min
+        self.events: deque[float] = deque()
+
+    def wait(self):
+        while True:
+            t = time.monotonic()
+            while self.events and t - self.events[0] >= 60:
+                self.events.popleft()
+            if len(self.events) < self.budget:
+                self.events.append(t)
+                return
+            time.sleep(max(0.05, 60 - (t - self.events[0]) + .05))
+
+
+class Http:
+    def __init__(self, db: Store, timeout: float):
+        self.db, self.timeout = db, timeout
+        self.buckets = {"gecko": RateBucket(8), "dex_fast": RateBucket(120),
+                        "dex_slow": RateBucket(30)}
+        self.backoff: dict[str, float] = defaultdict(float)
+
+    def get(self, provider: str, route: str, params: Optional[dict] = None):
+        if provider not in self.buckets or not route.startswith("/") or ".." in route:
+            raise ValueError("invalid provider or route")
+        path = route + ("?" + urllib.parse.urlencode(params) if params else "")
+        base = GECKO if provider == "gecko" else DEX
+        headers = {"User-Agent": "DEXMomentumLab/0.2 read-only", "Accept":
+                   "application/json;version=20230203" if provider == "gecko" else "application/json"}
+        failure = "unknown error"
+        for retry in range(3):
+            until = self.backoff[provider] - time.monotonic()
+            if until > 0:
+                time.sleep(until)
+            self.buckets[provider].wait()
+            requested, status, body, retry_after = now_ms(), None, None, None
+            try:
+                with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers, method="GET"),
+                                            timeout=self.timeout) as response:
+                    status = int(response.status)
+                    body = response.read(HTTP_BODY_MAX + 1)
+                if len(body) > HTTP_BODY_MAX:
+                    raise ValueError("response body exceeds size limit")
+                data = json.loads(body.decode("utf-8"))
+                observed = now_ms()  # timestamp AFTER full response and JSON parsing.
+                call_id = self.db.http_log(provider, path, requested, observed, status, body, None, retry)
+                return data, call_id, observed
+            except urllib.error.HTTPError as ex:
+                status = ex.code
+                retry_after = numeric(ex.headers.get("Retry-After")) if ex.headers else None
+                try:
+                    body = ex.read(16_384)
+                except OSError:
+                    pass
+                failure = f"HTTP {status}"
+            except (urllib.error.URLError, TimeoutError, ValueError, UnicodeError, OSError) as ex:
+                failure = f"{type(ex).__name__}: {str(ex)[:160]}"
+            completed = now_ms()
+            self.db.http_log(provider, path, requested, completed, status, body, failure, retry)
+            if status == 429:
+                back = min(max(retry_after or 15 * (retry + 1), 10), 180)
+            elif status is None or status >= 500:
+                back = (2 ** retry) * 2 + random.random()
+            else:
+                break
+            self.backoff[provider] = time.monotonic() + back
+        raise ApiFailure(f"{provider} {path}: {failure}")
+
+
+def gecko_address(pool: dict) -> str:
+    attrs = dictobj(pool.get("attributes"))
+    addr = address(attrs.get("address") or attrs.get("pool_address"))
+    if addr:
+        return addr
+    raw = str(pool.get("id") or "")
+    return address(raw[5:]) if raw.startswith("base_") else ""
+
+
+class Scanner:
+    def __init__(self, cfg: Config, store: Store, http: Optional[Http] = None):
+        self.cfg, self.db = cfg, store
+        self.http = http or Http(store, cfg.request_timeout)
+        self.last_discovery: Optional[float] = None
+        self.counter = 0
+        self.selection_round = 0
+        self.mature_borrowed = 0
+        self.waiting_candidates = 0
+        self.new_admissions = 0
+        self.active_windows = 0
+        self.phase = 'discovery'
+        self.campaign_discovery_end_ms: Optional[int] = None
+
+    def discover_gecko(self, source: str, path: str, params: dict):
+        for page in range(1, self.cfg.gecko_pages + 1):
+            try:
+                result, call, observed = self.http.get("gecko", path, {**params, "page": page})
+                items = dictobj(result).get("data")
+                if not isinstance(items, list):
+                    raise ValueError("Gecko response data is not a list")
+            except (ApiFailure, ValueError) as exc:
+                self.db.event("error", "discovery_failure", f"{source}, page={page}: {exc}")
+                continue
+            for rank, item in enumerate(items, 1 + (page - 1) * 20):
+                if not isinstance(item, dict):
+                    continue
+                a = gecko_address(item)
+                if not a:
+                    continue
+                attrs = dictobj(item.get("attributes"))
+                self.db.pool(a, observed, dt_ms(attrs.get("pool_created_at")))
+                self.db.discovery(source, "pool", a, rank, observed, call, item)
+            LOG.info("discovery=%s page=%d received=%d", source, page, len(items))
+
+    def discover_promoted(self):
+        for src, route in [("dex_profiles_promoted", "/token-profiles/latest/v1"),
+                           ("dex_boosts_promoted", "/token-boosts/latest/v1")]:
+            try:
+                response, call, observed = self.http.get("dex_slow", route)
+                if not isinstance(response, list):
+                    raise ValueError("promoted tokens expected array")
+            except (ValueError, ApiFailure) as exc:
+                self.db.event("error", "promoted_discovery_failure", f"{src}: {exc}")
+                continue
+            for rank, item in enumerate(response, 1):
+                if isinstance(item, dict) and str(item.get("chainId") or "").lower() == "base" and item.get("tokenAddress"):
+                    self.db.discovery(src, "token", item["tokenAddress"], rank, observed, call, item)
+
+    def resolve_promoted(self):
+        pending = self.db.token_pending(now_ms())
+        for batch in batches(pending, 15):
+            path = "/tokens/v1/base/" + ",".join(urllib.parse.quote(t["address"], safe="") for t in batch)
+            try:
+                response, call, observed = self.http.get("dex_fast", path)
+                if not isinstance(response, list):
+                    raise ValueError("token pair resolution expected array")
+            except (ApiFailure, ValueError) as exc:
+                self.db.event("error", "token_resolution_failure", str(exc))
+                continue
+            pairs = defaultdict(list)
+            for item in response:
+                if not isinstance(item, dict) or str(item.get("chainId") or "").lower() != "base":
+                    continue
+                tok = address(dictobj(item.get("baseToken")).get("address"))
+                if tok and item.get("pairAddress"):
+                    pairs[tok].append(item)
+            for t in batch:
+                for i, p in enumerate(sorted(pairs[t["address"]], key=lambda r: address(r["pairAddress"])), 1):
+                    self.remember_pair(p, observed)
+                    self.db.discovery("dex_promoted_resolved", "pool", p["pairAddress"], i, observed, call, p)
+                    # Preserve whether this promoted pool originated from a
+                    # paid boost or a token profile, rather than merging them.
+                    token_sources = self.db.cx.execute("""SELECT DISTINCT source FROM discoveries
+                        WHERE kind='token' AND item_key=?""", (t["token_key"],)).fetchall()
+                    for source_row in token_sources:
+                        self.db.discovery(source_row[0] + "_resolved_pool", "pool",
+                                          p["pairAddress"], i, observed, call, p)
+                self.db.token_resolved(t["address"], observed, len(pairs[t["address"]]))
+
+    def remember_pair(self, pair: dict, observed: int):
+        self.db.pool(pair["pairAddress"], observed, timestamp_ms(pair.get("pairCreatedAt")),
+                     str(pair.get("dexId") or "") or None,
+                     dictobj(pair.get("baseToken")).get("address"),
+                     dictobj(pair.get("baseToken")).get("symbol"),
+                     dictobj(pair.get("quoteToken")).get("address"))
+
+    def select(self, pools: list[sqlite3.Row]) -> tuple[list[tuple[sqlite3.Row, str, int]],
+                                                         list[tuple[sqlite3.Row, str, int]]]:
+        """Persistent FIFO-with-frozen-tie-breaker 30m/15m leases.
+
+        Selection uses only recorded discovery and admission history, never
+        provider momentum, future performance or after-the-fact liquidity.
+        When no slot is available the candidate WAITS; it is not a failed
+        trade, a negative observation or a 'skipped active quote'.
+        """
+        at = getattr(self, 'selection_time', now_ms())
+        cycle_id = getattr(self, 'current_cycle_id', None)
+        phase = getattr(self, 'phase', 'discovery')
+        if cycle_id is None:  # Direct offline scheduler tests; live cycle has already synchronized.
+            self.db.refresh_candidates(pools, at, self.cfg, cycle_id)
+        pmap = {p['pool_key']: p for p in pools}
+        follows = [p for p in pools if self.db.pool_cohort(p, at)[0] in
+                   ('paper_followup', 'mature_followup')]
+        follows.sort(key=lambda p: (0 if p['signal_id'] is not None else 1,
+                                    p['signal_ms'] if p['signal_id'] is not None else p['trigger_ms'],
+                                    p['pool_key']))
+        selected = [(p,'paper_followup' if p['signal_id'] is not None else 'mature_followup', i)
+                    for i,p in enumerate(follows,1)][:self.cfg.max_pools]
+        skipped = [(p,'paper_followup' if p['signal_id'] is not None else 'mature_followup', i)
+                   for i,p in enumerate(follows,1) if i>self.cfg.max_pools]
+        if skipped:
+            self.db.event('error','critical_followup_saturation',
+                          f'active_followups={len(follows)} exceed configured max={self.cfg.max_pools}')
+        followkeys = {p['pool_key'] for p in follows}
+        # Never evict an active admission just to make room for an arriving pool.
+        active = self.db.cx.execute("""SELECT * FROM candidate_windows WHERE
+           state IN ('admitted','observing','baseline_ready') AND admitted_ms<=?
+           AND window_end_ms>=? ORDER BY admitted_ms,seed_rank,pool_key""",(at,at)).fetchall()
+        leased=[]
+        for w in active:
+            p = pmap.get(w['pool_key'])
+            if p is not None and p['pool_key'] not in followkeys:
+                leased.append((p,'mature_trending' if w['cohort']=='mature_trending' else
+                               'young_window',len(leased)+1))
+        free = max(0,self.cfg.max_pools-len(selected))
+        selected.extend(leased[:free])
+        skipped.extend(leased[free:])
+        free=self.cfg.max_pools-len(selected)
+        young_used=sum(c=='young_window' for _,c,_ in selected)
+        mature_used=sum(c=='mature_trending' for _,c,_ in selected)
+        new_admissions=0
+        wait=[]
+        # Ending discovery never opens a new watch or reallocates waiting queues.
+        can_admit=(phase=='discovery' and
+                   (self.campaign_discovery_end_ms is None or at<self.campaign_discovery_end_ms))
+        if can_admit:
+            queued=self.db.cx.execute("""SELECT * FROM candidate_windows
+               WHERE state='queued' AND admission_deadline_ms>=?
+               ORDER BY origin_ms,seed_rank,pool_key""",(at,)).fetchall()
+            young=[w for w in queued if w['cohort']=='young' and w['pool_key'] in pmap]
+            mature=[w for w in queued if w['cohort']=='mature_trending' and w['pool_key'] in pmap]
+            taken=set(followkeys)|{p['pool_key'] for p,_,_ in selected}
+            def admit_queue(q, quota=None):
+                nonlocal free,young_used,mature_used,new_admissions
+                remaining=[]
+                for w in q:
+                    if w['pool_key'] in taken:
+                        remaining.append(w)
+                        continue
+                    if free<=0 or (quota is not None and
+                                   (young_used if w['cohort']=='young' else mature_used)>=quota):
+                        remaining.append(w)
+                        continue
+                    self.db.admit_candidate(w,at,cycle_id)
+                    p=pmap[w['pool_key']]
+                    stratum='young_window' if w['cohort']=='young' else 'mature_trending'
+                    selected.append((p,stratum,len(selected)+1))
+                    taken.add(w['pool_key'])
+                    if stratum=='young_window':young_used+=1
+                    else:mature_used+=1
+                    new_admissions+=1
+                    free-=1
+                return remaining
+            # Targets are set before experiment; lease commitments can make
+            # instantaneous 70/20 targets infeasible, which is explicitly reported.
+            young=admit_queue(young,min(self.cfg.young_target_pools,self.cfg.max_pools))
+            mature=admit_queue(mature,min(self.cfg.mature_max_pools,self.cfg.max_pools))
+            young=admit_queue(young)
+            mature=admit_queue(mature)
+            # Untouched queues remain visible as waiting admissions, NOT sampled misses.
+            wait=young+mature
+            wait.sort(key=lambda w:(w['origin_ms'],w['seed_rank']))
+            skipped += [(pmap[w['pool_key']],'waiting_admission',i)
+                        for i,w in enumerate(wait,1) if w['pool_key'] in pmap]
+        self.mature_borrowed=max(0,mature_used-self.cfg.mature_max_pools)
+        self.waiting_candidates=len(wait)
+        self.new_admissions=new_admissions
+        self.active_windows=sum(c in ('young_window','mature_trending') for _,c,_ in selected)
+        return selected,skipped
+
+    def cycle(self, run_id: int, phase: str = "discovery"):
+        if phase not in ("discovery", "drain"):
+            raise ValueError("invalid experiment phase")
+        self.counter += 1
+        cycle_id = self.db.cycle_start(run_id, phase)
+        self.selection_round = cycle_id  # diagnostic only; admission ranks are immutable
+        self.current_cycle_id = cycle_id
+        self.phase = phase
+        start = time.monotonic()
+        if phase == "discovery" and (self.last_discovery is None or start - self.last_discovery >= self.cfg.discovery_every):
+            self.last_discovery = start
+            self.discover_gecko("gecko_new", "/networks/base/new_pools", {})
+            self.discover_gecko("gecko_trending_5m", "/networks/base/trending_pools", {"duration": "5m"})
+            if self.cfg.promoted:
+                self.discover_promoted()
+        if self.cfg.promoted and phase == "discovery":
+            self.resolve_promoted()
+        when = now_ms()
+        universe = self.db.pool_universe()
+        eligible = [p for p in universe if self.db.pool_cohort(p, when)[0] != "inactive"
+                    and (phase == "discovery" or self.db.pool_cohort(p, when)[0]
+                         in ("paper_followup", "mature_followup"))]
+        # Persist expired/queued/admitted states even for pools outside the old
+        # 24h observation cohort; never erase discovery or silent nonadmission.
+        if phase == 'discovery':
+            self.db.refresh_candidates(universe, when, self.cfg, cycle_id)
+        # A fixed as-of timestamp prevents future API responses affecting the
+        # admission ranking of this cycle.
+        self.selection_time = when
+        selected, skipped = self.select(eligible)
+        actual_skips=sum(1 for _,stratum,_ in skipped if stratum!='waiting_admission')
+        if actual_skips:
+            self.db.event('warning','active_slot_overflow',
+                          f'cycle={cycle_id} missed_active_slots={actual_skips} cap={self.cfg.max_pools}')
+        assigned: dict[str, tuple[sqlite3.Row, int]] = {}
+        for p, stratum, rank in selected:
+            assigned[p["pool_key"]] = (p, self.db.assignment(
+                cycle_id, p["pool_key"], stratum, rank, "selected", None, when))
+        for p, stratum, rank in skipped:
+            waiting = stratum == 'waiting_admission'
+            aid = self.db.assignment(cycle_id, p["pool_key"], stratum, rank,
+                                     'waiting_admission' if waiting else 'skipped_capacity',
+                                     'queued_no_capacity_not_an_observation' if waiting
+                                     else 'active_observation_overflow', when)
+            if not waiting:
+                self.db.update_candidate_sample(p['pool_key'], when, None, None, failed=True)
+            if p["signal_id"] is not None and p["signal_ms"] <= when <= p["signal_ms"] + FOLLOWUP_MS:
+                self.db.followup(p["signal_id"], aid, None, "skipped_capacity")
+            if p["exploration_id"] is not None and p["trigger_ms"] <= when <= p["trigger_ms"] + FOLLOWUP_MS:
+                self.db.exploratory_followup(p["exploration_id"], aid, None, "skipped_capacity")
+        if phase == "discovery":
+            for p, reason in self.db.ineligible_pools(when, universe):
+                self.db.assignment(cycle_id, p["pool_key"], "out_of_watch_window", 0,
+                                   "temporarily_ineligible", reason, when)
+        sampled, failed, signals, exploratory = 0, 0, 0, 0
+        for batch in batches(list(assigned.values()), 15):
+            path = "/latest/dex/pairs/base/" + ",".join(
+                urllib.parse.quote(p["address"], safe="") for p, _ in batch)
+            try:
+                data, call, observed = self.http.get("dex_fast", path)
+                if not isinstance(data, dict) or not isinstance(data.get("pairs"), (list, type(None))):
+                    raise ValueError("pair response pairs field missing/invalid")
+                if "pairs" not in data:
+                    raise ValueError("pair response missing pairs field")
+            except (ApiFailure, ValueError) as exc:
+                self.db.event("error", "pair_batch_failure", f"{path[:200]}: {exc}")
+                for p, aid in batch:
+                    self.db.assignment_result(aid, "api_failure", None, None, str(exc)[:300])
+                    sig = self.db.prior_signal(p["pool_key"])
+                    if sig and sig["signal_ms"] <= when <= sig["signal_ms"] + FOLLOWUP_MS:
+                        self.db.followup(sig["id"], aid, None, "api_failure")
+                    exp = self.db.prior_exploration(p["pool_key"])
+                    if exp and exp["trigger_ms"] <= when <= exp["trigger_ms"] + FOLLOWUP_MS:
+                        self.db.exploratory_followup(exp["id"], aid, None, "api_failure")
+                    self.db.update_candidate_sample(p['pool_key'], when, None, None, failed=True)
+                    failed += 1
+                continue
+            returned = {}
+            for entry in data.get("pairs") or []:
+                if not isinstance(entry, dict) or str(entry.get("chainId") or "").lower() != "base":
+                    continue
+                if entry.get("pairAddress"):
+                    returned[key(entry["pairAddress"])] = entry
+            for p, aid in batch:
+                item = returned.get(p["pool_key"])
+                prev = self.db.last_snapshot(p["pool_key"])
+                # NOTE: calculate baseline before adding current snapshot; assignment
+                # current slot has disposition 'selected', not a past failure.
+                base = self.db.baseline(p["pool_key"], observed, self.cfg)
+                snapshot = self.db.snapshot(p["pool_key"], observed, call, item)
+                if snapshot is None:
+                    self.db.assignment_result(aid, "api_failure", call, None,
+                                              "duplicate snapshot timestamp; no new as-of observation")
+                    self.db.update_candidate_sample(p['pool_key'], when, None, None, failed=True)
+                    failed += 1
+                    continue
+                if item:
+                    self.remember_pair(item, observed)
+                self.db.assignment_result(aid, "sampled", call, snapshot["id"], snapshot["status"])
+                sampled += 1
+                # Refresh pool from DB after quote to see newly populated creation time.
+                fresh_pool = self.db.cx.execute("""SELECT p.*, t.first_seen_ms AS first_trending_ms
+                    FROM pools p LEFT JOIN memberships t ON t.pool_key=p.pool_key
+                    AND t.source='gecko_trending_5m' WHERE p.pool_key=?""", (p["pool_key"],)).fetchone()
+                cohort, _ = self.db.pool_cohort(p, when)
+                # A lease for the OTHER cohort cannot authorize a signal.
+                # This matters when provider pairCreatedAt resolves only after
+                # the first quote, changing an initially unknown-age pool.
+                lease_cohort = ('young' if cohort in ('young', 'age_unknown') else
+                                'mature_trending' if cohort == 'mature_trending' else None)
+                window = (self.db.cx.execute("""SELECT admitted_ms,window_end_ms
+                      FROM candidate_windows WHERE pool_key=? AND cohort=?
+                        AND admitted_ms IS NOT NULL
+                        AND state IN ('admitted','observing','baseline_ready')""",
+                      (p['pool_key'], lease_cohort)).fetchone()
+                          if lease_cohort is not None else None)
+                within_window = (window is not None
+                                 and window['admitted_ms'] <= snapshot['observed_ms']
+                                 <= window['window_end_ms'])
+                allow_signal = (phase == 'discovery' and within_window
+                                and (self.campaign_discovery_end_ms is None or
+                                     snapshot['observed_ms'] <= self.campaign_discovery_end_ms))
+                decided_cohort = (cohort if allow_signal else 'followup_or_outside_watch')
+                signal_ok, exploratory_ok, gain = self.db.record_filters(
+                    snapshot, base, fresh_pool, self.cfg, cohort=decided_cohort)
+                if allow_signal and signal_ok and base is not None and gain is not None:
+                    signals += int(self.db.signal(snapshot, base, fresh_pool, gain, self.cfg) is not None)
+                if allow_signal and exploratory_ok and base is not None and gain is not None:
+                    exploratory += int(self.db.exploratory_trigger(
+                        snapshot, base, fresh_pool, gain, self.cfg) is not None)
+                self.db.update_candidate_sample(p['pool_key'], snapshot['observed_ms'], snapshot, base)
+                self.db.evaluate_risk(snapshot, prev)
+                signal = self.db.prior_signal(p["pool_key"])
+                if signal and signal["signal_ms"] <= when <= signal["signal_ms"] + FOLLOWUP_MS:
+                    self.db.followup(signal["id"], aid, snapshot, "sampled")
+                exp = self.db.prior_exploration(p["pool_key"])
+                if exp and exp["trigger_ms"] <= when <= exp["trigger_ms"] + FOLLOWUP_MS:
+                    self.db.exploratory_followup(exp["id"], aid, snapshot, "sampled")
+        self.db.cycle_finish(cycle_id, len(eligible), len(selected), sampled,
+                             actual_skips, failed, signals, self.mature_borrowed,
+                             self.waiting_candidates, self.new_admissions, self.active_windows)
+        LOG.info("cycle=%d phase=%s discovered_eligible=%d monitoring=%d snapshots=%d young_signals_new=%d mature_triggers_new=%d mature_borrowed=%d queued=%d admitted_new=%d missed_active=%d api_failed_slots=%d",
+                 self.counter, phase, len(eligible), len(selected), sampled, signals, exploratory,
+                 self.mature_borrowed, self.waiting_candidates, self.new_admissions, actual_skips, failed)
+
+    def run(self, cycles: Optional[int], discovery_hours: Optional[int] = None,
+            drain_followups: bool = False):
+        # Do not start a new observation window when a crashed campaign resumes.
+        campaign = (self.db.prepare_campaign(self.cfg, discovery_hours)
+                    if discovery_hours is not None else None)
+        if campaign is None and self.db.cx.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0]:
+            raise ValueError("campaign database requires --discovery-hours and --drain-followups to resume")
+        self.campaign_discovery_end_ms = campaign["discovery_end_ms"] if campaign else None
+        run_id = self.db.start_run(self.cfg)
+        LOG.info("DEX Momentum V%s READ ONLY | Base | db=%s | config_sha256=%s | discovery_end=%s",
+                 VERSION, self.cfg.db, self.cfg.digest(),
+                 iso(campaign["discovery_end_ms"]) if campaign else "none")
+        completed = False
+        try:
+            while True:
+                t0 = time.monotonic()
+                phase = "discovery"
+                if campaign:
+                    if now_ms() >= campaign["discovery_end_ms"]:
+                        phase = "drain"
+                elif cycles is not None and self.counter >= cycles:
+                    phase = "drain" if drain_followups else "done"
+                if phase == "done":
+                    completed = True
+                    break
+                if phase == "drain":
+                    # Also censor open candidate-only leases after a bounded
+                    # --cycles pilot with --drain-followups, not just campaigns.
+                    self.db.close_discovery_windows(now_ms(), self.cfg)
+                if phase == "drain" and self.db.active_followups(now_ms()) == 0:
+                    completed = True
+                    break
+                self.cycle(run_id, phase)
+                if cycles is not None and not drain_followups and self.counter >= cycles:
+                    completed = True
+                    break
+                wait = self.cfg.interval - (time.monotonic() - t0)
+                if wait > 0:
+                    time.sleep(wait)
+        except KeyboardInterrupt:
+            LOG.warning("Stop requested by operator: any unfinished 24h followups will remain censored")
+        finally:
+            self.db.finish_run(run_id)
+            if completed and campaign:
+                self.db.complete_campaign()
+            LOG.info("SUMMARY %s", canon(self.db.summary()))
+
+
+def report(db: Store):
+    print("DEX MOMENTUM V0.2.3.1 — FROZEN ADMISSIONS / SEPARATE COHORTS / NOT EXECUTABLE PNL")
+    print(json.dumps(db.summary(), ensure_ascii=False, indent=2))
+    rows = list(db.signal_reports())
+    complete = sum(bool(s["evaluable_24h"]) for s in rows)
+    print(f"YOUNG FOLLOWUP COVERAGE: complete_24h={complete}/{len(rows)}; "
+          "all other records must NOT be used for unconditional 24h performance stats")
+    for s in rows[-25:]:
+        print(f"PAPER SIGNAL {s['signal_utc']} {s['pool_key']} gain={s['observed_gain_pct']:.3f}% "
+              f"sampled_MFE={s['observed_mfe_pct']} sampled_MAE={s['observed_mae_pct']} "
+              f"outcome={s['maturity']} gaps={s['long_gap_count']} "
+              f"max_gap_s={s['max_unobserved_gap_s']} evaluable_24h={s['evaluable_24h']}")
+    print("WARNING: Mature exploratory triggers are NOT official paper signals.")
+    for e in list(db.exploratory_reports())[-25:]:
+        print(f"MATURE EXPLORATORY {e['trigger_utc']} {e['pool_key']} gain={e['observed_gain_pct']:.3f}% "
+              f"sampled_MFE={e['observed_mfe_pct']} sampled_MAE={e['observed_mae_pct']} "
+              f"outcome={e['maturity']} gaps={e['long_gap_count']} "
+              f"max_gap_s={e['max_unobserved_gap_s']} evaluable_24h={e['evaluable_24h']}")
+    print("WARNING: Sampled quotes are not executable trades, fees/slippage and 24h outcomes may be missing.")
+
+
+def export_csv(db: Store, output: str):
+    dest = Path(output).absolute()
+    if dest == db.db_path:
+        raise ValueError("cannot overwrite DB with CSV")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["id", "pool_key", "signal_utc", "signal_ms", "entry_usd", "observed_gain_pct",
+               "source_memberships_json", "observed_mfe_pct", "observed_mae_pct",
+               "time_to_sampled_peak_s", "observed_max_drawdown_pct", "latest_sampled_return_pct",
+               "priced_samples", "missing_or_unpriced", "skipped_or_failed_followups",
+               "maturity", "observed_24h_return_pct", "evaluable_24h",
+               "continuous_through_cutoff", "long_gap_count", "max_unobserved_gap_s",
+               "coverage_fraction_approx", "expected_observation_slots_approx"]
+    with dest.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(db.signal_reports())
+    print(f"CSV saved: {dest}")
+
+
+def export_exploratory_csv(db: Store, output: str):
+    """Export mature-cohort triggers separately; NEVER merge with paper signals."""
+    dest = Path(output).absolute()
+    if dest == db.db_path:
+        raise ValueError("cannot overwrite DB with CSV")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["id", "pool_key", "trigger_utc", "trigger_ms", "entry_usd",
+               "observed_gain_pct", "first_trending_ms", "source_memberships_json",
+               "observed_mfe_pct", "observed_mae_pct", "time_to_sampled_peak_s",
+               "observed_max_drawdown_pct", "priced_samples",
+               "skipped_or_failed_followups", "maturity", "observed_24h_return_pct",
+               "evaluable_24h", "continuous_through_cutoff", "long_gap_count",
+               "max_unobserved_gap_s", "coverage_fraction_approx", "expected_observation_slots_approx"]
+    with dest.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(db.exploratory_reports())
+    print(f"Exploratory CSV saved: {dest}")
+
+
+def export_candidates_csv(db: Store, output: str):
+    """Audit ALL discovered pools, including candidates never admitted.
+
+    Unclassified discovery records are exported with unknown outcome, not
+    silently discarded as negatives. A pool may have two distinct cohort
+    windows at different times; never merge their outcomes.
+    """
+    dest=Path(output).absolute()
+    if dest==db.db_path:
+        raise ValueError('cannot overwrite the SQLite DB with CSV')
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    fields=['pool_key','first_discovery_utc','created_ms','base_token','sources',
+            'cohort','state','origin_utc','admission_deadline_utc','admitted_utc',
+            'watch_end_utc','first_sample_utc','last_sample_utc','sample_count',
+            'baseline_reached','bad_quote_count','failed_slot_count','reason',
+            'official_paper_signal','mature_exploratory_trigger']
+    with dest.open('w',newline='',encoding='utf-8') as file:
+        writer=csv.DictWriter(file,fieldnames=fields)
+        writer.writeheader()
+        rows=db.cx.execute("""SELECT p.pool_key,p.first_seen_ms,p.created_ms,p.base_token,
+             w.cohort,w.state,w.origin_ms,w.admission_deadline_ms,w.admitted_ms,
+             w.window_end_ms,w.first_sample_ms,w.last_sample_ms,w.sample_count,
+             w.baseline_reached,w.bad_quote_count,w.failed_slot_count,w.reason,
+             s.id AS signal_id,e.id AS exploration_id
+             FROM pools p LEFT JOIN candidate_windows w ON w.pool_key=p.pool_key
+             LEFT JOIN signals s ON s.pool_key=p.pool_key
+             LEFT JOIN exploratory_triggers e ON e.pool_key=p.pool_key
+             ORDER BY p.first_seen_ms,p.pool_key,w.cohort""")
+        for r in rows:
+            writer.writerow({
+                'pool_key':r['pool_key'],'first_discovery_utc':iso(r['first_seen_ms']),
+                'created_ms':r['created_ms'],'base_token':r['base_token'],
+                'sources':canon(db.membership_sources(r['pool_key'])),
+                'cohort':r['cohort'] or 'unclassified',
+                'state':r['state'] or 'discovered_unclassified',
+                'origin_utc':iso(r['origin_ms']) if r['origin_ms'] is not None else '',
+                'admission_deadline_utc':iso(r['admission_deadline_ms']) if r['admission_deadline_ms'] is not None else '',
+                'admitted_utc':iso(r['admitted_ms']) if r['admitted_ms'] is not None else '',
+                'watch_end_utc':iso(r['window_end_ms']) if r['window_end_ms'] is not None else '',
+                'first_sample_utc':iso(r['first_sample_ms']) if r['first_sample_ms'] is not None else '',
+                'last_sample_utc':iso(r['last_sample_ms']) if r['last_sample_ms'] is not None else '',
+                'sample_count':r['sample_count'] or 0,
+                'baseline_reached':r['baseline_reached'] or 0,
+                'bad_quote_count':r['bad_quote_count'] or 0,
+                'failed_slot_count':r['failed_slot_count'] or 0,
+                'reason':r['reason'] or 'creation_time_unresolved_or_not_eligible',
+                'official_paper_signal':int(r['signal_id'] is not None),
+                'mature_exploratory_trigger':int(r['exploration_id'] is not None),
+            })
+    print(f'Candidate audit CSV saved: {dest}')
+
+
+class OfflineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(db=str(Path(self.tmp.name) / "v0231.sqlite3"))
+        self.db = Store(self.cfg.db)
+        self.at = now_ms()
+        self.addr = "0xabc"
+        self.poolkey = key(self.addr)
+        self.pair = {"chainId": "base", "pairAddress": self.addr,
+                     "pairCreatedAt": self.at - 600_000,
+                     "priceUsd": "1", "liquidity": {"usd": "25000"},
+                     "volume": {"m5": "5000"}, "txns": {"m5": {"buys": 25, "sells": 10}},
+                     "priceChange": {"m5": 4}, "baseToken": {"address": "0xdef", "symbol": "DEF"},
+                     "quoteToken": {"address": "0xusdc"}}
+        self.db.pool(self.addr, self.at - 400_000, self.pair["pairCreatedAt"])
+        self.db.discovery("gecko_new", "pool", self.addr, 1, self.at - 400_000, None, {})
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def current_pool(self):
+        return self.db.cx.execute("SELECT * FROM pools WHERE pool_key=?", (self.poolkey,)).fetchone()
+
+    def test_schema_lock_and_readonly(self):
+        self.assertEqual(self.db.cx.execute("PRAGMA user_version").fetchone()[0], 6)
+        with self.assertRaises(WriterLocked):
+            Store(self.cfg.db)
+        with StoreForTestReadonly(self.cfg.db) as readonly:
+            self.assertEqual(readonly.summary()["pools"], 1)
+
+    def test_new_trending_membership_overlap_and_rank(self):
+        self.db.discovery("gecko_trending_5m", "pool", self.addr, 2, self.at, None, {})
+        self.assertEqual(self.db.membership_sources(self.poolkey), ["gecko_new", "gecko_trending_5m"])
+        self.assertEqual(self.db.cx.execute("SELECT first_rank FROM memberships WHERE source='gecko_new'").fetchone()[0], 1)
+
+    def test_preregistered_thresholds_no_baseline(self):
+        snap = self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        states, gain = evaluate(snap, None, self.current_pool(), self.cfg)
+        self.assertEqual(states["baseline"], "unknown")
+        self.assertEqual(states["volume_m5"], "pass")
+        self.assertIsNone(gain)
+
+    def test_signal_two_real_samples_and_immutable(self):
+        first = self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        second = self.db.snapshot(self.poolkey, self.at + 180_000, None, {**self.pair, "priceUsd": "1.05"})
+        states, gain = evaluate(second, first, self.current_pool(), self.cfg)
+        self.assertTrue(all(x == "pass" for x in states.values()))
+        self.assertIsNotNone(self.db.signal(second, first, self.current_pool(), gain, self.cfg))
+        self.assertIsNone(self.db.signal(second, first, self.current_pool(), gain, self.cfg))
+        self.assertEqual(self.db.summary()["signals"], 1)
+
+    def test_missing_breaks_baseline(self):
+        self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        self.db.snapshot(self.poolkey, self.at + 60_000, None, None)
+        self.assertIsNone(self.db.baseline(self.poolkey, self.at + 180_000, self.cfg))
+
+    def test_skipped_capacity_breaks_baseline(self):
+        self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        rid = self.db.start_run(self.cfg)
+        cid = self.db.cycle_start(rid)
+        self.db.assignment(cid, self.poolkey, "gecko_new", 1, "skipped_capacity", "test", self.at + 60_000)
+        self.assertIsNone(self.db.baseline(self.poolkey, self.at + 180_000, self.cfg))
+
+    def test_risk_liquidity_crash_not_fraud_label(self):
+        scanner = Scanner(self.cfg, self.db)
+        earlier = self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        later = self.db.snapshot(self.poolkey, self.at + 60_000, None,
+                                  {**self.pair, "liquidity": {"usd": 200}})
+        scanner.db.evaluate_risk(later, earlier)
+        risk = self.db.cx.execute("SELECT * FROM risk_events").fetchone()
+        self.assertEqual(risk["kind"], "liquidity_crash_suspected")
+        self.assertEqual(risk["status"], "suspected")
+
+    def test_price_change_minus_100_alone_not_price_crash(self):
+        scanner = Scanner(self.cfg, self.db)
+        a = self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        b = self.db.snapshot(self.poolkey, self.at + 60_000, None,
+                             {**self.pair, "priceChange": {"m5": -100}})
+        scanner.db.evaluate_risk(b, a)
+        kinds = [r[0] for r in self.db.cx.execute("SELECT kind FROM risk_events")]
+        self.assertIn("provider_5m_change_anomaly", kinds)
+        self.assertNotIn("price_crash_observed", kinds)
+
+    def test_missing_twice_is_not_rug(self):
+        scanner = Scanner(self.cfg, self.db)
+        a = self.db.snapshot(self.poolkey, self.at, None, None)
+        b = self.db.snapshot(self.poolkey, self.at + 60_000, None, None)
+        scanner.db.evaluate_risk(b, a)
+        self.assertEqual(self.db.cx.execute("SELECT kind FROM risk_events").fetchone()[0], "missing_quotes")
+
+    def test_zero_and_null_distinct(self):
+        snap = self.db.snapshot(self.poolkey, self.at, None,
+                                {**self.pair, "volume": {"m5": 0}, "txns": {"m5": {}}})
+        self.assertEqual(snap["volume_m5_usd"], 0)
+        self.assertIsNone(snap["buys_m5"])
+        self.assertIsNone(snap["sells_m5"])
+
+    def test_fair_capacity_accounts_for_all_candidates(self):
+        for i in range(110):
+            a = f"0x{i:040x}"
+            self.db.pool(a, self.at, self.at - 400_000)
+            self.db.discovery("gecko_new", "pool", a, 1, self.at, None, {})
+        sc = Scanner(self.cfg, self.db)
+        selected, skipped = sc.select(self.db.eligible_pools(self.at))
+        self.assertEqual(len(selected), 90)
+        self.assertEqual(len(selected) + len(skipped), 111)
+
+    def test_config_lock_rejects_threshold_or_schedule_change(self):
+        self.db.start_run(self.cfg)
+        from dataclasses import replace
+        with self.assertRaises(ValueError):
+            self.db.start_run(replace(self.cfg, interval=120))
+
+    def test_end_to_end_offline_two_cycles_and_risk(self):
+        # Fixture observations must be later than the locally recorded run start.
+        self.at += 10_000
+        class MockHttp:
+            def __init__(self, at, pair):
+                self.at, self.pair, self.polls = at, pair, 0
+            def get(self, provider, route, params=None):
+                if provider == "gecko":
+                    return {"data": [{"id": "base_0xabc", "attributes": {
+                        "address": "0xabc", "pool_created_at": iso(self.at - 600_000)}}]}, None, self.at
+                self.polls += 1
+                price = "1" if self.polls == 1 else "1.05"
+                return {"pairs": [{**self.pair, "priceUsd": price}]}, None, self.at
+        http = MockHttp(self.at, self.pair)
+        sc = Scanner(self.cfg, self.db, http)
+        rid = self.db.start_run(self.cfg)
+        sc.cycle(rid)
+        self.assertEqual(self.db.summary()["signals"], 0)
+        http.at += 180_000
+        sc.cycle(rid)
+        self.assertEqual(self.db.summary()["signals"], 1)
+        self.assertEqual(self.db.summary()["snapshots"], 2)
+        self.assertEqual(self.db.summary()["assignments_by_disposition"].get("sampled"), 2)
+
+    def test_report_horizon_censoring(self):
+        s1 = self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        s2 = self.db.snapshot(self.poolkey, self.at + 180_000, None, {**self.pair, "priceUsd": "1.05"})
+        self.db.signal(s2, s1, self.current_pool(), 5.0, self.cfg)
+        result = list(self.db.signal_reports(current=self.at + 200_000))[0]
+        self.assertTrue(result["maturity"].startswith("pending_"))
+        self.assertIsNone(result["observed_24h_return_pct"])
+
+
+    def test_interrupted_cycle_reconciles_and_breaks_baseline(self):
+        self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        run_id = self.db.start_run(self.cfg)
+        cycle_id = self.db.cycle_start(run_id)
+        aid = self.db.assignment(cycle_id, self.poolkey, "gecko_new", 1,
+                                 "selected", None, self.at + 60_000)
+        self.db.start_run(self.cfg)  # simulate process restart after crash
+        status = self.db.cx.execute("SELECT disposition FROM assignments WHERE id=?", (aid,)).fetchone()[0]
+        self.assertEqual(status, "api_failure")
+        self.assertIsNone(self.db.baseline(self.poolkey, self.at + 180_000, self.cfg))
+        self.assertEqual(self.db.cx.execute("SELECT COUNT(*) FROM operational_events WHERE category='interrupted_cycle_recovery'").fetchone()[0], 1)
+
+    def test_v01_database_refused_without_schema_changes(self):
+        path = Path(self.tmp.name) / "legacy.sqlite3"
+        with sqlite3.connect(path) as cx:
+            cx.execute("CREATE TABLE snapshots (id INTEGER PRIMARY KEY)")
+        with self.assertRaisesRegex(ValueError, "refusing to touch"):
+            Store(str(path))
+        with sqlite3.connect(path) as cx:
+            self.assertEqual(cx.execute("PRAGMA user_version").fetchone()[0], 0)
+            self.assertEqual(cx.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0], 1)
+
+    def test_prior_signal_priority_and_overflow(self):
+        from dataclasses import replace
+        self.db.pool("0xelse", self.at, self.at - 500_000)
+        self.db.discovery("gecko_trending_5m", "pool", "0xelse", 1, self.at, None, {})
+        prior = self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        current = self.db.snapshot(self.poolkey, self.at + 180_000, None,
+                                   {**self.pair, "priceUsd": "1.05"})
+        self.db.signal(current, prior, self.current_pool(), 5.0, self.cfg)
+        cfg = replace(self.cfg, max_pools=1)
+        sc=Scanner(cfg,self.db)
+        sc.selection_time=self.at+200_000
+        chosen, missed = sc.select(self.db.eligible_pools(self.at + 200_000))
+        self.assertEqual(chosen[0][0]["pool_key"], self.poolkey)
+        self.assertEqual(len(missed), 1)
+
+    def test_risk_persistence_not_independent_verification(self):
+        sc = Scanner(self.cfg, self.db)
+        a = self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        b = self.db.snapshot(self.poolkey, self.at + 60_000, None,
+                             {**self.pair, "liquidity": {"usd": 200}})
+        sc.db.evaluate_risk(b, a)
+        c = self.db.snapshot(self.poolkey, self.at + 120_000, None,
+                             {**self.pair, "liquidity": {"usd": 150}})
+        sc.db.evaluate_risk(c, b)
+        ev = self.db.cx.execute("SELECT * FROM risk_events WHERE kind='liquidity_crash_suspected'").fetchone()
+        self.assertEqual(ev["status"], "persistent")
+        self.assertEqual(self.db.cx.execute("SELECT COUNT(*) FROM risk_confirmations").fetchone()[0], 1)
+
+    def test_age_ineligible_is_explicit_assignment(self):
+        old = "0xold"
+        now = now_ms()
+        self.db.pool(old, now - 300_000_000, now - 300_000_000)
+        self.db.discovery("gecko_trending_5m", "pool", old, 1, now, None, {})
+        self.assertNotIn(key(old), [r[0]["pool_key"] for r in self.db.ineligible_pools(now)])
+        self.assertIn(key(old), [r["pool_key"] for r in self.db.eligible_pools(now)])
+
+    def test_pair_api_failure_does_not_create_fake_missing_snapshot(self):
+        class FailingHttp:
+            def get(self, provider, path, params=None):
+                if provider == "gecko":
+                    return {"data": []}, None, now_ms()
+                raise ApiFailure("fixture simulated HTTP 429 then exhausted retries")
+        scanner = Scanner(self.cfg, self.db, FailingHttp())
+        run = self.db.start_run(self.cfg)
+        scanner.cycle(run)
+        summary = self.db.summary()
+        self.assertEqual(summary["snapshots"], 0)
+        self.assertEqual(summary["assignments_by_disposition"].get("api_failure"), 1)
+
+    def test_mature_is_sampled_but_never_official(self):
+        old = "0xoldmature"
+        created = self.at - 30 * FOLLOWUP_MS
+        self.db.pool(old, self.at, created)
+        self.db.discovery("gecko_trending_5m", "pool", old, 1, self.at, None, {})
+        rows = self.db.eligible_pools(self.at + 1000)
+        matching = [p for p in rows if p["pool_key"] == key(old)]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(self.db.pool_cohort(matching[0], self.at + 1000)[0], "mature_trending")
+        pair = {**self.pair, "pairAddress": old, "pairCreatedAt": created}
+        s1 = self.db.snapshot(key(old), self.at + 1000, None, pair)
+        s2 = self.db.snapshot(key(old), self.at + 181_000, None, {**pair, "priceUsd": "1.05"})
+        pool = [p for p in self.db.pool_universe() if p["pool_key"] == key(old)][0]
+        official, mature, gain = self.db.record_filters(s2, s1, pool, self.cfg, "mature_trending")
+        self.assertFalse(official)
+        self.assertTrue(mature)
+        self.assertIsNotNone(self.db.exploratory_trigger(s2, s1, pool, gain, self.cfg))
+        self.assertEqual(self.db.summary()["signals"], 0)
+        self.assertEqual(self.db.summary()["mature_exploratory_triggers"], 1)
+        decision = self.db.cx.execute("SELECT * FROM filter_decisions WHERE snapshot_id=?", (s2["id"],)).fetchone()
+        self.assertEqual(decision["cohort"], "mature_trending")
+        self.assertEqual(decision["eligible"], 0)
+        self.assertEqual(decision["exploratory_eligible"], 1)
+        self.assertEqual(json.loads(decision["states_json"])["pool_age"], "fail")
+        report = list(self.db.exploratory_reports(current=self.at + 200_000))
+        self.assertEqual(report[0]["maturity"], "pending_right_censored_if_stopped_now")
+        self.assertGreaterEqual(report[0]["observed_mfe_pct"], 0)
+
+    def test_mature_no_pretrending_baseline(self):
+        old = "0xmaturebaseline"
+        created = self.at - 5 * FOLLOWUP_MS
+        self.db.pool(old, self.at - 200_000, created)
+        p = {**self.pair, "pairAddress": old, "pairCreatedAt": created}
+        early = self.db.snapshot(key(old), self.at - 180_000, None, p)
+        self.db.discovery("gecko_trending_5m", "pool", old, 1, self.at, None, {})
+        current = self.db.snapshot(key(old), self.at + 60_000, None, {**p, "priceUsd": "1.06"})
+        pool = [v for v in self.db.pool_universe() if v["pool_key"] == key(old)][0]
+        official, mature, _ = self.db.record_filters(current, early, pool, self.cfg, "mature_trending")
+        self.assertFalse(official)
+        self.assertFalse(mature)
+        self.assertEqual(self.db.summary()["mature_exploratory_triggers"], 0)
+
+    def test_mature_quota_and_young_reserved_capacity(self):
+        from dataclasses import replace
+        for i in range(95):
+            addr = f"0xyoung{i:04d}"
+            self.db.pool(addr, self.at, self.at - 600_000)
+            self.db.discovery("gecko_new", "pool", addr, 1, self.at, None, {})
+        for i in range(40):
+            addr = f"0xaged{i:04d}"
+            self.db.pool(addr, self.at, self.at - 4 * FOLLOWUP_MS)
+            self.db.discovery("gecko_trending_5m", "pool", addr, 1, self.at, None, {})
+        cfg = replace(self.cfg, max_pools=90, mature_max_pools=20)
+        sc = Scanner(cfg, self.db)
+        sc.selection_time = self.at + 1000
+        picked, skipped = sc.select(self.db.eligible_pools(self.at + 1000))
+        self.assertEqual(len(picked), 90)
+        self.assertEqual(len([p for p in picked if p[1] == "mature_trending"]), 20)
+        self.assertEqual(len([p for p in picked if p[1] != "mature_trending"]), 70)
+        self.assertEqual(len(picked) + len(skipped), 136)
+
+    def test_old_not_trending_ineligible(self):
+        addr = "0xnottreding"
+        self.db.pool(addr, self.at, self.at - 3 * FOLLOWUP_MS)
+        self.db.discovery("gecko_new", "pool", addr, 1, self.at, None, {})
+        self.assertNotIn(key(addr), [p["pool_key"] for p in self.db.eligible_pools(self.at)])
+        inactive = dict((p["pool_key"], why) for p, why in self.db.ineligible_pools(self.at))
+        self.assertEqual(inactive[key(addr)], "outside_eligible_young_or_mature_cohorts")
+
+    def test_mature_watch_expires_at_24_hours(self):
+        old = "0xexpiredwatch"
+        self.db.pool(old, self.at, self.at - 50 * FOLLOWUP_MS)
+        self.db.discovery("gecko_trending_5m", "pool", old, 1, self.at, None, {})
+        r = [p for p in self.db.pool_universe() if p["pool_key"] == key(old)][0]
+        self.assertEqual(self.db.pool_cohort(r, self.at + FOLLOWUP_MS)[0], "mature_trending")
+        self.assertEqual(self.db.pool_cohort(r, self.at + FOLLOWUP_MS + 1)[0], "inactive")
+
+    def test_mature_trigger_followup_priority(self):
+        from dataclasses import replace
+        old = "0xpriorold"
+        created = self.at - 5 * FOLLOWUP_MS
+        self.db.pool(old, self.at, created)
+        self.db.discovery("gecko_trending_5m", "pool", old, 1, self.at, None, {})
+        pair = {**self.pair, "pairAddress": old, "pairCreatedAt": created}
+        s1 = self.db.snapshot(key(old), self.at, None, pair)
+        s2 = self.db.snapshot(key(old), self.at + 180_000, None, {**pair, "priceUsd": "1.05"})
+        pool = [p for p in self.db.pool_universe() if p["pool_key"] == key(old)][0]
+        self.db.exploratory_trigger(s2, s1, pool, 5.0, self.cfg)
+        sc = Scanner(replace(self.cfg, max_pools=1), self.db)
+        sc.selection_time = self.at + 190_000
+        choices, dropped = sc.select(self.db.eligible_pools(self.at + 190_000))
+        self.assertEqual(choices[0][0]["pool_key"], key(old))
+        self.assertEqual(choices[0][1], "mature_followup")
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(self.db.summary()["signals"], 0)
+
+    def test_mature_config_is_frozen(self):
+        from dataclasses import replace
+        self.db.start_run(self.cfg)
+        with self.assertRaisesRegex(ValueError, "FROZEN CONFIG"):
+            self.db.start_run(replace(self.cfg, mature_max_pools=19))
+
+    def test_protection_against_legacy_filename(self):
+        for name in ("dex_momentum_v01.sqlite3", "dex_momentum_v02.sqlite3", "dex_momentum_v021.sqlite3", "dex_momentum_v022.sqlite3", "dex_momentum_v023.sqlite3"):
+            with self.assertRaisesRegex(ValueError, "legacy"):
+                Store(str(Path(self.tmp.name) / name))
+            self.assertFalse((Path(self.tmp.name) / name).exists())
+
+    def test_end_to_end_mature_trending_two_cycles(self):
+        now = self.at + 12_000
+        old = "0xoldfixture"
+        created = now - 4 * FOLLOWUP_MS
+        pair = {**self.pair, "pairAddress": old, "pairCreatedAt": created}
+        class MockHttp:
+            def __init__(self):
+                self.at, self.polls = now, 0
+            def get(self, provider, route, params=None):
+                if provider == "gecko":
+                    if "new_pools" in route:
+                        return {"data": []}, None, self.at
+                    return {"data": [{"id": "base_" + old, "attributes": {
+                        "address": old, "pool_created_at": iso(created)}}]}, None, self.at
+                self.polls += 1
+                p = {**pair, "priceUsd": "1" if self.polls == 1 else "1.05"}
+                return {"pairs": [p]}, None, self.at
+        mock = MockHttp()
+        sc = Scanner(self.cfg, self.db, mock)
+        rid = self.db.start_run(self.cfg)
+        from unittest.mock import patch
+        with patch(f"{__name__}.now_ms", return_value=mock.at):
+            sc.cycle(rid)
+        self.assertEqual(self.db.summary()["signals"], 0)
+        mock.at += 180_000
+        with patch(f"{__name__}.now_ms", return_value=mock.at):
+            sc.cycle(rid)
+        self.assertEqual(self.db.summary()["signals"], 0)
+        self.assertEqual(self.db.summary()["mature_exploratory_triggers"], 1)
+        self.assertIn("mature_trending", self.db.summary()["snapshot_cohort_counts"])
+
+    def test_http_429_retry_attempts_recorded(self):
+        import io
+        from unittest.mock import patch
+        class OK:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self, *_):
+                return b'{"data":[]}'
+        ex = urllib.error.HTTPError("https://example.test/", 429, "limit", {"Retry-After": "1"}, io.BytesIO(b'limit'))
+        with patch("urllib.request.urlopen", side_effect=[ex, OK()]), patch("time.sleep"):
+            payload, _, _ = Http(self.db, 1).get("gecko", "/networks/base/new_pools")
+        self.assertEqual(payload["data"], [])
+        self.assertEqual(self.db.cx.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0], 2)
+        self.assertEqual(self.db.cx.execute("SELECT COUNT(*) FROM api_calls WHERE http_status=429").fetchone()[0], 1)
+
+
+    def test_mature_borrows_unused_capacity_without_exceeding_budget(self):
+        from dataclasses import replace
+        for i in range(60):
+            a = f"0xborrow{i:04d}"
+            self.db.pool(a, self.at, self.at - 5 * FOLLOWUP_MS)
+            self.db.discovery("gecko_trending_5m", "pool", a, 1, self.at, None, {})
+        cfg = replace(self.cfg, max_pools=45, mature_max_pools=20)
+        sc = Scanner(cfg, self.db)
+        sc.selection_time = self.at + 1000
+        selected, skipped = sc.select(self.db.eligible_pools(self.at + 1000))
+        self.assertEqual(len(selected), 45)
+        self.assertEqual(len(selected) + len(skipped), 61)
+        self.assertEqual(sum(stratum == "mature_trending" for _,stratum,_ in selected), 44)
+        self.assertGreater(sc.mature_borrowed, 0)
+        self.assertLessEqual(len(selected), cfg.max_pools)
+
+    def test_mature_lease_stable_across_cycles(self):
+        from dataclasses import replace
+        for i in range(60):
+            a = f"0xrotation{i:04d}"
+            self.db.pool(a, self.at, self.at - 5 * FOLLOWUP_MS)
+            self.db.discovery("gecko_trending_5m", "pool", a, 1, self.at, None, {})
+        sc = Scanner(replace(self.cfg, max_pools=20), self.db)
+        sc.selection_time = self.at + 1000
+        sets = []
+        for round_no in range(1, 6):
+            sc.selection_round = round_no
+            picked, _ = sc.select(self.db.eligible_pools(self.at + 1000))
+            sets.append({p["pool_key"] for p, _, _ in picked})
+        self.assertTrue(all(s == sets[0] for s in sets))
+        self.assertEqual(len(sets[0]), 20)
+
+    def test_campaign_fixed_wall_clock_end_on_restart(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        with patch(f"{__name__}.now_ms", return_value=self.at):
+            original = self.db.prepare_campaign(self.cfg, 72)
+        with patch(f"{__name__}.now_ms", return_value=self.at + 90_000):
+            resumed = self.db.prepare_campaign(self.cfg, 72)
+        self.assertEqual(original["discovery_end_ms"], resumed["discovery_end_ms"])
+        self.assertEqual(original["discovery_end_ms"], self.at + 72 * 3_600_000)
+        with self.assertRaisesRegex(ValueError, "campaign locked"):
+            self.db.prepare_campaign(self.cfg, 48)
+        with self.assertRaisesRegex(ValueError, "campaign locked"):
+            self.db.prepare_campaign(replace(self.cfg, interval=120), 72)
+        self.db.complete_campaign()
+        with self.assertRaisesRegex(ValueError, "completed"):
+            self.db.prepare_campaign(self.cfg, 72)
+
+    def test_campaign_requires_fresh_database_not_pilot(self):
+        run = self.db.start_run(self.cfg)
+        self.db.cycle_start(run)
+        with self.assertRaisesRegex(ValueError, "EMPTY"):
+            self.db.prepare_campaign(self.cfg, 72)
+
+    def test_drain_samples_only_followups_and_no_new_discovery(self):
+        from unittest.mock import patch
+        first = self.db.snapshot(self.poolkey, self.at, None, self.pair)
+        second = self.db.snapshot(self.poolkey, self.at + 180_000, None,
+                                  {**self.pair, "priceUsd": "1.05"})
+        self.db.signal(second, first, self.current_pool(), 5.0, self.cfg)
+        other = "0xuncalled"
+        self.db.pool(other, self.at, self.at - 600_000)
+        self.db.discovery("gecko_new", "pool", other, 1, self.at, None, {})
+        class MockHttp:
+            def __init__(self, t):
+                self.t=t
+                self.calls=[]
+            def get(self, provider, route, params=None):
+                self.calls.append((provider,route))
+                if provider == "gecko":
+                    raise AssertionError("drain phase must never issue discovery requests")
+                return {"pairs": [{**self_pair, "priceUsd": "1.06"}]}, None, self.t
+        self_pair = self.pair
+        target = self.at + 240_000
+        http = MockHttp(target)
+        scanner = Scanner(self.cfg,self.db,http)
+        run = self.db.start_run(self.cfg)
+        with patch(f"{__name__}.now_ms", return_value=target):
+            scanner.cycle(run,"drain")
+        self.assertEqual(self.db.summary()["signals"],1)
+        self.assertEqual(self.db.summary()["snapshots"],3)
+        self.assertEqual(self.db.summary()["cycles_by_phase"].get("drain"),1)
+        self.assertEqual(len(http.calls),1)
+        self.assertEqual(self.db.cx.execute("SELECT COUNT(*) FROM snapshots WHERE pool_key=?",(key(other),)).fetchone()[0],0)
+
+    def test_gap_detection_after_stopped_pilot_and_horizon_point(self):
+        first = self.db.snapshot(self.poolkey,self.at,None,self.pair)
+        sig_snap = self.db.snapshot(self.poolkey,self.at+180_000,None,{**self.pair,"priceUsd":"1.05"})
+        self.db.signal(sig_snap,first,self.current_pool(),5.0,self.cfg)
+        sig_at = sig_snap["observed_ms"]
+        premature = list(self.db.signal_reports(current=sig_at+6*3_600_000))[0]
+        self.assertEqual(premature["maturity"],"pending_right_censored_if_stopped_now")
+        self.assertGreater(premature["long_gap_count"],0)
+        self.assertFalse(premature["evaluable_24h"])
+        last = sig_at+FOLLOWUP_MS-30_000
+        self.db.snapshot(self.poolkey,last,None,{**self.pair,"priceUsd":"1.3"})
+        complete = list(self.db.signal_reports(current=sig_at+FOLLOWUP_MS+1000))[0]
+        self.assertEqual(complete["maturity"],"horizon_observed_with_gaps")
+        self.assertFalse(complete["evaluable_24h"])
+        self.assertIsNotNone(complete["observed_24h_return_pct"])
+        self.assertGreater(complete["max_unobserved_gap_s"], 3_600)
+
+    def test_campaign_end_with_no_followups_exits_and_marks_complete(self):
+        from unittest.mock import patch
+        with patch(f"{__name__}.now_ms", return_value=self.at):
+            self.db.prepare_campaign(self.cfg,1)
+        with patch(f"{__name__}.now_ms", return_value=self.at+3_600_001):
+            Scanner(self.cfg,self.db).run(None,discovery_hours=1,drain_followups=True)
+        self.assertEqual(self.db.summary()["cycles"],0)
+        self.assertEqual(self.db.campaign_summary()["phase_now"],"complete")
+        with self.assertRaisesRegex(ValueError,"completed"):
+            self.db.prepare_campaign(self.cfg,1)
+
+    def test_config_and_schema_isolation_v021_database(self):
+        original = Path(self.tmp.name)/"dex_momentum_v021.sqlite3"
+        with sqlite3.connect(original) as cx:
+            cx.execute("PRAGMA user_version=3")
+        with self.assertRaisesRegex(ValueError,"legacy"):
+            Store(str(original),write=True)
+        with sqlite3.connect(original) as cx:
+            self.assertEqual(cx.execute("PRAGMA user_version").fetchone()[0],3)
+
+    def test_api_response_after_campaign_end_cannot_create_signal(self):
+        from unittest.mock import patch
+        target=self.at+180_000
+        pair_old=self.db.snapshot(self.poolkey,self.at,None,self.pair)
+        class MockHttp:
+            def get(self, provider, route, params=None):
+                if provider == "gecko":
+                    return {"data": []}, None, target-1
+                return {"pairs": [{**pair, "priceUsd": "1.05"}]}, None, target
+        pair=self.pair
+        sc=Scanner(self.cfg,self.db,MockHttp())
+        sc.campaign_discovery_end_ms=target-10
+        run=self.db.start_run(self.cfg)
+        with patch(f"{__name__}.now_ms", return_value=target-1000):
+            sc.cycle(run, "discovery")
+        self.assertEqual(self.db.summary()["signals"],0)
+        self.assertEqual(self.db.summary()["snapshots"],2)
+        self.assertEqual(self.db.summary()["cycles_by_phase"]["discovery"],1)
+
+    def test_file_csv_includes_coverage_warning_fields(self):
+        first=self.db.snapshot(self.poolkey,self.at,None,self.pair)
+        second=self.db.snapshot(self.poolkey,self.at+180_000,None,
+                                {**self.pair, "priceUsd":"1.05"})
+        self.db.signal(second,first,self.current_pool(),5,self.cfg)
+        out=str(Path(self.tmp.name)/"signals.csv")
+        export_csv(self.db,out)
+        with open(out,encoding="utf-8",newline="") as fh:
+            row=next(csv.DictReader(fh))
+        self.assertIn("evaluable_24h",row)
+        self.assertIn("long_gap_count",row)
+        self.assertEqual(row["evaluable_24h"],"False")
+
+class AdmissionTests(unittest.TestCase):
+    """Offline, no HTTP, synthetic as-of timestamp tests for V0.2.3.1."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.cfg=Config(db=str(Path(self.temp.name)/'v0231.sqlite3'))
+        self.db=Store(self.cfg.db)
+        self.at=now_ms()
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def add(self,name: str,cohort: str='young',found=None):
+        t=self.at if found is None else found
+        created=t-600_000 if cohort=='young' else t-3*FOLLOWUP_MS
+        self.db.pool(name,t,created)
+        self.db.discovery('gecko_new' if cohort=='young' else 'gecko_trending_5m',
+                          'pool',name,1,t,None,{})
+        return key(name)
+
+    def pool(self,k):
+        return [p for p in self.db.pool_universe() if p['pool_key']==k][0]
+
+    def choose(self,at,cfg=None,phase='discovery'):
+        cfg=cfg or self.cfg
+        sc=Scanner(cfg,self.db)
+        sc.selection_time=at
+        sc.phase=phase
+        return sc, *sc.select(self.db.eligible_pools(at))
+
+    def admission(self,k,cohort='young'):
+        return self.db.cx.execute('SELECT * FROM candidate_windows WHERE pool_key=? AND cohort=?',
+                                  (k,cohort)).fetchone()
+
+    def test_v023_schema_and_old_v022_database_protection(self):
+        self.assertEqual(self.db.cx.execute('PRAGMA user_version').fetchone()[0],6)
+        old=Path(self.temp.name)/'dex_momentum_v022.sqlite3'
+        with self.assertRaisesRegex(ValueError,'legacy'):
+            Store(str(old))
+        self.assertFalse(old.exists())
+
+    def test_admission_end_anchored_to_original_discovery(self):
+        k=self.add('0xanchor')
+        _,selected,_=self.choose(self.at+60_000)
+        self.assertEqual(len(selected),1)
+        w=self.admission(k)
+        self.assertEqual(w['origin_ms'],self.at)
+        self.assertEqual(w['window_end_ms'],self.at+1_800_000)
+        self.assertEqual(w['admitted_ms'],self.at+60_000)
+        self.assertEqual(w['admission_deadline_ms'],self.at+1_620_000)
+        # Rediscovery must not extend the start/end of the lease.
+        self.db.discovery('gecko_new','pool','0xanchor',1,self.at+600_000,None,{})
+        self.choose(self.at+600_000)
+        self.assertEqual(self.admission(k)['window_end_ms'],self.at+1_800_000)
+
+    def test_saturation_lease_never_rotates_during_window(self):
+        ks={self.add(f'0xlease{i:04d}') for i in range(115)}
+        sc,selected,skipped=self.choose(self.at)
+        first={p['pool_key'] for p,_,_ in selected}
+        self.assertEqual(len(selected),90)
+        self.assertEqual(len(skipped),25)
+        self.assertEqual(len(ks),115)
+        for i in range(10):
+            self.add(f'0xinflux{i:04d}',found=self.at+60_000)
+        sc,selected,skipped=self.choose(self.at+60_000)
+        self.assertEqual({p['pool_key'] for p,_,_ in selected},first)
+        self.assertEqual(sc.waiting_candidates,35)
+        self.assertEqual(self.db.candidate_report()['cohorts']['young']['admitted'],90)
+
+    def test_quota_young_and_mature_are_precommitted(self):
+        for i in range(100):self.add(f'0xyoung{i}')
+        for i in range(50):self.add(f'0xmature{i}','mature_trending')
+        _,picked,waiting=self.choose(self.at)
+        self.assertEqual(len(picked),90)
+        self.assertEqual(sum(c=='young_window' for _,c,_ in picked),70)
+        self.assertEqual(sum(c=='mature_trending' for _,c,_ in picked),20)
+        self.assertEqual(len(waiting),60)
+
+    def test_mature_borrows_when_young_absent(self):
+        for i in range(60):self.add(f'0xm{i}','mature_trending')
+        sc,chosen,_=self.choose(self.at)
+        self.assertEqual(len(chosen),60)
+        self.assertEqual(sc.mature_borrowed,40)
+        self.add('0xnewyoung',found=self.at+60_000)
+        _,later,_=self.choose(self.at+60_000)
+        self.assertIn(key('0xnewyoung'),{p['pool_key'] for p,_,_ in later})
+
+    def test_borrowed_mature_lease_not_evicted_by_later_young(self):
+        for i in range(90):self.add(f'0xold{i}','mature_trending')
+        _,first,_=self.choose(self.at)
+        first_keys={p['pool_key'] for p,_,_ in first}
+        for i in range(8):self.add(f'0xlateyoung{i}',found=self.at+60_000)
+        _,later,waiting=self.choose(self.at+60_000)
+        self.assertEqual({p['pool_key'] for p,_,_ in later},first_keys)
+        self.assertEqual(len(waiting),8)
+        self.assertEqual({x[1] for x in waiting},{'waiting_admission'})
+
+    def test_never_admitted_expiry_cannot_be_negative_signal(self):
+        self.add('0xfirst')
+        self.add('0xsecond')
+        from dataclasses import replace
+        narrow=replace(self.cfg,max_pools=1,young_target_pools=1)
+        _,selected,waiting=self.choose(self.at,narrow)
+        self.assertEqual(len(waiting),1)
+        queued_key=waiting[0][0]['pool_key']
+        self.choose(self.at+1_621_000,narrow)
+        w=self.admission(queued_key)
+        self.assertEqual(w['state'],'not_admitted_capacity')
+        self.assertIsNone(w['admitted_ms'])
+        self.assertEqual(self.db.cx.execute('SELECT COUNT(*) FROM signals').fetchone()[0],0)
+
+    def test_created_after_admission_deadline_is_not_backfilled(self):
+        k=self.add('0xalreadyseen','young',found=self.at-1_700_000)
+        sc,chosen,_=self.choose(self.at)
+        self.assertFalse(chosen)
+        self.assertEqual(self.admission(k)['state'],'not_admitted_late')
+
+    def test_mature_watch_is_15m_after_trending(self):
+        k=self.add('0xoldtrending','mature_trending')
+        self.choose(self.at)
+        w=self.admission(k,'mature_trending')
+        self.assertEqual(w['window_end_ms'],self.at+900_000)
+        self.assertEqual(w['admission_deadline_ms'],self.at+720_000)
+
+    def test_no_baseline_means_observation_incomplete_after_30m(self):
+        k=self.add('0xincomplete')
+        self.choose(self.at)
+        pair={'priceUsd':'1','liquidity':{'usd':'20000'},
+              'volume':{'m5':'5000'},'txns':{'m5':{'buys':25,'sells':10}},
+              'priceChange':{'m5':4},'pairCreatedAt':self.at-600_000}
+        snap=self.db.snapshot(k,self.at,None,pair)
+        self.db.update_candidate_sample(k,self.at,snap,None)
+        self.db.refresh_candidates(self.db.pool_universe(),self.at+1_801_000,self.cfg)
+        self.assertEqual(self.admission(k)['state'],'observation_incomplete')
+        self.assertEqual(self.db.candidate_report()['cohorts']['young']['states'].get('watch_completed_no_signal',0),0)
+
+    def test_full_regular_30m_window_can_close_no_signal(self):
+        k=self.add('0xcomplete')
+        self.choose(self.at)
+        pair={'priceUsd':'1','liquidity':{'usd':'25000'},
+              'volume':{'m5':'5000'},'txns':{'m5':{'buys':25,'sells':10}},
+              'priceChange':{'m5':4},'pairCreatedAt':self.at-600_000}
+        first=None
+        for i in range(30):
+            t=self.at+i*60_000
+            snap=self.db.snapshot(k,t,None,pair)
+            if first is None:first=snap
+            self.db.update_candidate_sample(k,t,snap,first if i>=3 else None)
+        self.db.refresh_candidates(self.db.pool_universe(),self.at+1_801_000,self.cfg)
+        self.assertEqual(self.admission(k)['state'],'watch_completed_no_signal')
+
+    def test_followup_priority_when_regular_watch_is_at_cap(self):
+        from dataclasses import replace
+        k=self.add('0xsignal')
+        self.add('0xother')
+        pair={'priceUsd':'1','liquidity':{'usd':'25000'},'volume':{'m5':'5000'},
+              'txns':{'m5':{'buys':25,'sells':10}},'priceChange':{'m5':4},
+              'pairCreatedAt':self.at-600_000}
+        before=self.db.snapshot(k,self.at,None,pair)
+        after=self.db.snapshot(k,self.at+180_000,None,{**pair,'priceUsd':'1.05'})
+        self.db.signal(after,before,self.pool(k),5.0,self.cfg)
+        _,selected,_=self.choose(self.at+240_000,replace(self.cfg,max_pools=1))
+        self.assertEqual(selected[0][0]['pool_key'],k)
+        self.assertEqual(selected[0][1],'paper_followup')
+
+    def test_drain_prevents_new_admissions(self):
+        k=self.add('0xnothandled')
+        _,picked,_=self.choose(self.at,phase='drain')
+        self.assertFalse(picked)
+        self.assertIsNone(self.admission(k)['admitted_ms'])
+
+    def test_campaign_cutoff_censors_active_and_waiting(self):
+        from dataclasses import replace
+        self.add('0xone')
+        self.add('0xtwo')
+        self.choose(self.at,replace(self.cfg,max_pools=1))
+        self.db.close_discovery_windows(self.at+30_000,self.cfg)
+        rows=self.db.cx.execute('SELECT state FROM candidate_windows ORDER BY pool_key').fetchall()
+        self.assertEqual({r[0] for r in rows},{'observation_incomplete','not_admitted_campaign_end'})
+
+    def test_restart_keeps_original_lease_end(self):
+        k=self.add('0xrestart')
+        self.choose(self.at)
+        end=self.admission(k)['window_end_ms']
+        self.db.start_run(self.cfg)
+        self.db.close()
+        self.db=Store(self.cfg.db)
+        self.db.start_run(self.cfg)
+        self.assertEqual(self.admission(k)['window_end_ms'],end)
+        self.assertEqual(self.db.cx.execute('SELECT COUNT(*) FROM candidate_events WHERE pool_key=?',(k,)).fetchone()[0],2)
+
+    def test_campaign_cutoff_preserves_active_official_followup(self):
+        k=self.add('0xkeepsignal')
+        self.choose(self.at)
+        pair={'priceUsd':'1','liquidity':{'usd':'25000'},'volume':{'m5':'5000'},
+              'txns':{'m5':{'buys':25,'sells':10}},'priceChange':{'m5':4},
+              'pairCreatedAt':self.at-600_000}
+        first=self.db.snapshot(k,self.at,None,pair)
+        sigsnap=self.db.snapshot(k,self.at+180_000,None,{**pair,'priceUsd':'1.05'})
+        self.db.signal(sigsnap,first,self.pool(k),5.0,self.cfg)
+        self.db.close_discovery_windows(self.at+200_000,self.cfg)
+        self.assertEqual(self.admission(k)['state'],'signal_followup')
+        self.assertEqual(self.db.active_followups(self.at+200_000),1)
+
+    def test_admission_fraction_does_not_hide_waiting(self):
+        from dataclasses import replace
+        for i in range(12):self.add(f'0xdenom{i}')
+        self.choose(self.at,replace(self.cfg,max_pools=4,young_target_pools=4))
+        r=self.db.candidate_report()['cohorts']['young']
+        self.assertEqual(r['eligible_window_candidates'],12)
+        self.assertEqual(r['admitted'],4)
+        self.assertEqual(r['never_admitted'],8)
+        self.assertEqual(r['admission_fraction'],0.3333)
+        self.assertEqual(r['states']['queued'],8)
+
+    def test_api_quote_outside_window_not_official_eligible(self):
+        """A delayed API quote must never produce a late paper signal."""
+        k=self.add('0xlatequote')
+        self.choose(self.at)
+        pair={'priceUsd':'1','liquidity':{'usd':'25000'},'volume':{'m5':'5000'},
+              'txns':{'m5':{'buys':25,'sells':10}},'priceChange':{'m5':4},
+              'pairCreatedAt':self.at-600_000}
+        first=self.db.snapshot(k,self.at,None,pair)
+        late=self.db.snapshot(k,self.at+1_801_000,None,{**pair,'priceUsd':'1.1'})
+        row=self.db.cx.execute('SELECT window_end_ms FROM candidate_windows WHERE pool_key=?',(k,)).fetchone()
+        self.assertGreater(late['observed_ms'],row['window_end_ms'])
+        ok, exploratory,_=self.db.record_filters(late,first,self.pool(k),self.cfg,
+                                                  cohort='followup_or_outside_watch')
+        self.assertFalse(ok)
+        self.assertFalse(exploratory)
+
+    def test_bounded_pilot_drain_censors_regular_leases(self):
+        """A bounded pilot with drain must not leave old leases looking active."""
+        from unittest.mock import patch
+        k=self.add('0xcensorafterpilot')
+        class MockHttp:
+            def get(self,provider,route,params=None):
+                if provider == 'gecko':
+                    return {'data':[]},None,self_at
+                return {'pairs':[]},None,self_at
+        self_at=self.at+1000
+        scanner=Scanner(self.cfg,self.db,MockHttp())
+        with patch(f'{__name__}.now_ms',return_value=self_at), patch(f'{__name__}.time.sleep'):
+            scanner.run(cycles=1,drain_followups=True)
+        self.assertEqual(self.admission(k)['state'],'observation_incomplete')
+        self.assertEqual(self.db.summary()['signals'],0)
+
+    def test_readonly_export_includes_nonadmitted_and_unclassified(self):
+        self.add('0xeligible')
+        self.db.pool('0xoldonly',self.at,self.at-3*FOLLOWUP_MS)
+        self.db.discovery('gecko_new','pool','0xoldonly',1,self.at,None,{})
+        self.choose(self.at)
+        dest=str(Path(self.temp.name)/'audit.csv')
+        readonly=Store(self.cfg.db,write=False)
+        try:
+            export_candidates_csv(readonly,dest)
+        finally:
+            readonly.close()
+        with open(dest,encoding='utf-8') as file:
+            rows=list(csv.DictReader(file))
+        self.assertEqual(len(rows),2)
+        self.assertEqual({r['state'] for r in rows},{'admitted','discovered_unclassified'})
+
+
+class CoverageReportingTests(unittest.TestCase):
+    """Reporting-only regression tests against V0.2.3.1 SQLite schema.
+
+    No HTTP, no strategy changes and no inference of a missing quote.
+    """
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory()
+        self.cfg=Config(db=str(Path(self.tmp.name)/'v0231_test.sqlite3'))
+        self.db=Store(self.cfg.db)
+        self.at=now_ms()
+        self.run_id=self.db.start_run(self.cfg)
+        self.pk=key('0xcoverage')
+        self.db.pool('0xcoverage',self.at,self.at-600_000)
+        self.db.discovery('gecko_new','pool','0xcoverage',1,self.at,None,{})
+        sc=Scanner(self.cfg,self.db)
+        sc.selection_time=self.at
+        sc.phase='discovery'
+        picked,_=sc.select(self.db.eligible_pools(self.at))
+        self.assertEqual(len(picked),1)
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def insert_slot(self,t:int,price:str='1',late_ms:int=0):
+        cid=self.db.cycle_start(self.run_id)
+        aid=self.db.assignment(cid,self.pk,'young_window',0,'selected',None,t)
+        pair={'priceUsd':price,'liquidity':{'usd':20000},'volume':{'m5':5000},
+              'txns':{'m5':{'buys':25,'sells':10}},'priceChange':{'m5':4},
+              'pairCreatedAt':self.at-600_000}
+        snap=self.db.snapshot(self.pk,t+late_ms,None,pair)
+        self.db.assignment_result(aid,'sampled',None,snap['id'],snap['status'])
+        self.db.update_candidate_sample(self.pk,snap['observed_ms'],snap,None)
+        self.db.cycle_finish(cid,1,1,1,0,0,0)
+        return snap
+
+    def test_freeze_after_campaign_censor_and_delayed_report(self):
+        self.insert_slot(self.at)
+        self.insert_slot(self.at+60_000)
+        self.db.close_discovery_windows(self.at+61_000,self.cfg)
+        before=self.db.candidate_report()['cohorts']['young']
+        self.assertEqual(before['incomplete_breakdown']['administratively_right_censored'],1)
+        self.assertEqual(before['continuity_approx_mean_of_admitted'],1.0)
+        with unittest.mock.patch(f'{__name__}.now_ms',return_value=self.at+5*FOLLOWUP_MS):
+            after=self.db.candidate_report()['cohorts']['young']
+        self.assertEqual(after,before)
+
+    def test_cycles_assignments_and_priced_are_distinct(self):
+        self.insert_slot(self.at,'1')
+        self.insert_slot(self.at+60_000,'0')  # unpriced is NOT a zero-valued return
+        self.db.close_discovery_windows(self.at+61_000,self.cfg)
+        young=self.db.candidate_report()['cohorts']['young']
+        cov=young['recorded_cycle_coverage']
+        self.assertEqual(cov['expected_opportunities_in_recorded_cycles'],2)
+        self.assertEqual(cov['assigned_observation_slots'],2)
+        self.assertEqual(cov['sampled_assignments'],2)
+        self.assertEqual(cov['valid_priced_assignments'],1)
+        self.assertEqual(cov['bad_quote_assignments'],1)
+        self.assertEqual(cov['valid_price_fraction_of_sampled_assignments'],0.5)
+        self.assertEqual(young['bad_quote_slots'],1)
+
+    def test_late_api_response_reported_but_not_eligible(self):
+        # The cycle selected within the original 30m watch but the quote
+        # arrived strictly after its frozen end. Record_filters remains frozen.
+        t=self.at+1_800_000
+        cid=self.db.cycle_start(self.run_id)
+        aid=self.db.assignment(cid,self.pk,'young_window',0,'selected',None,t)
+        snap=self.db.snapshot(self.pk,t+98,None,{'priceUsd':'1','liquidity':{'usd':20000},
+              'volume':{'m5':5000},'txns':{'m5':{'buys':25,'sells':10}},
+              'priceChange':{'m5':4},'pairCreatedAt':self.at-600_000})
+        self.db.assignment_result(aid,'sampled',None,snap['id'],snap['status'])
+        self.db.record_filters(snap,None,self.db.pool_universe()[0],self.cfg,
+                               cohort='followup_or_outside_watch')
+        self.db.cycle_finish(cid,1,1,1,0,0,0)
+        self.db.close_discovery_windows(t+1000,self.cfg)
+        outside=self.db._outside_window_decisions()
+        self.assertEqual(outside['total'],1)
+        self.assertEqual(outside['reasons'],{'response_after_fixed_window_end':1})
+        cov=self.db.candidate_report()['cohorts']['young']['recorded_cycle_coverage']
+        self.assertEqual(cov['sampled_but_response_after_watch'],1)
+        self.assertEqual(cov['valid_priced_assignments'],1)
+        self.assertEqual(cov['valid_priced_inside_watch'],0)
+        self.assertEqual(self.db.summary()['signals'],0)
+
+    def test_classification_quality_incomplete_is_not_censor(self):
+        self.insert_slot(self.at)
+        self.db.refresh_candidates(self.db.pool_universe(),self.at+1_801_000,self.cfg)
+        young=self.db.candidate_report()['cohorts']['young']
+        self.assertEqual(young['incomplete_breakdown']['missing_or_inadequate_observation'],1)
+        self.assertEqual(young['incomplete_breakdown']['administratively_right_censored'],0)
+
+    def test_candidate_never_admitted_retained_in_denominator(self):
+        self.db.pool('0xwaiting',self.at,self.at-600_000)
+        self.db.discovery('gecko_new','pool','0xwaiting',2,self.at,None,{})
+        self.db.refresh_candidates(self.db.pool_universe(),self.at,self.cfg)
+        c=self.db.candidate_report()['cohorts']['young']
+        self.assertEqual(c['eligible_window_candidates'],2)
+        self.assertEqual(c['admitted'],1)
+        self.assertEqual(c['never_admitted'],1)
+        self.assertEqual(c['admission_fraction'],0.5)
+
+    def test_no_legacy_v023_db_overwrite_or_report(self):
+        legacy=Path(self.tmp.name)/'legacy_v023.sqlite3'
+        with sqlite3.connect(str(legacy)) as cx:
+            cx.execute('PRAGMA user_version=5')
+        with self.assertRaisesRegex(ValueError,'unexpected DB schema'):
+            Store(str(legacy))
+        with self.assertRaisesRegex(ValueError,'unexpected schema version'):
+            Store(str(legacy),write=False)
+        with sqlite3.connect(str(legacy)) as cx:
+            self.assertEqual(cx.execute('PRAGMA user_version').fetchone()[0],5)
+
+    def test_report_does_not_write_database(self):
+        self.insert_slot(self.at)
+        self.db.finish_run(self.run_id)
+        before=self.db.cx.execute('SELECT total_changes()').fetchone()[0]
+        readonly=Store(self.cfg.db,write=False)
+        try:
+            a=readonly.summary()
+            b=readonly.summary()
+        finally:
+            readonly.close()
+        self.assertEqual(a,b)
+        self.assertEqual(self.db.cx.execute('SELECT total_changes()').fetchone()[0],before)
+
+    def test_zero_candidate_covers_missing_denominator(self):
+        temp=tempfile.TemporaryDirectory()
+        try:
+            cfg=Config(db=str(Path(temp.name)/'empty_v0231.sqlite3'))
+            db=Store(cfg.db)
+            try:
+                r=db.candidate_report()
+                self.assertIsNone(r['cohorts']['young']['continuity_approx_mean_of_admitted'])
+                self.assertIsNone(r['cohorts']['young']['recorded_cycle_coverage']['sampled_fraction_of_recorded_cycle_opportunities'])
+            finally:
+                db.close()
+        finally:
+            temp.cleanup()
+
+
+
+class StoreForTestReadonly:
+    def __init__(self, path):
+        self.path = path
+    def __enter__(self):
+        self.obj = Store(self.path, write=False)
+        return self.obj
+    def __exit__(self, *_):
+        self.obj.close()
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="DEX Momentum V0.2.3.1 Base READ ONLY prospective observer")
+    parser.add_argument("--db", default="data/dex_momentum_v0231.sqlite3")
+    parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--discovery-every", type=int, default=180)
+    parser.add_argument("--max-pools", type=int, default=90)
+    parser.add_argument("--mature-reserved-pools", "--mature-max-pools",
+                        dest="mature_max_pools", type=int, default=20,
+                        help="mature reserved quota (0..20), may borrow otherwise idle slots under total cap")
+    parser.add_argument("--gecko-pages", type=int, default=1)
+    parser.add_argument("--networks", nargs="+", choices=["base"], default=["base"])
+    parser.add_argument("--with-promoted-discovery", action="store_true",
+                        help="include separate promotional token cohort; OFF by default")
+    parser.add_argument("--no-paid-discovery", action="store_true", help="V0.1 CLI compatibility")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--cycles", type=int, help="pilot cycles; optionally drain existing followups")
+    parser.add_argument("--discovery-hours", type=int,
+                        help="prospective fixed-duration discovery window in wall-clock hours (fresh DB)")
+    parser.add_argument("--drain-followups", action="store_true",
+                        help="after discovery, follow active young/mature signals until 24h horizons")
+    parser.add_argument("--report", action="store_true")
+    parser.add_argument("--export-csv", help="export ONLY official young paper signals")
+    parser.add_argument("--export-exploratory-csv", help="export ONLY mature exploratory triggers")
+    parser.add_argument("--export-candidates-csv", help="audit ALL discovered pools and admission decisions")
+    parser.add_argument("--self-test", action="store_true", help="offline only, no API")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)sZ %(levelname)s %(message)s")
+    logging.Formatter.converter = time.gmtime
+    if args.self_test:
+        suite = unittest.TestSuite([
+            unittest.defaultTestLoader.loadTestsFromTestCase(OfflineTests),
+            unittest.defaultTestLoader.loadTestsFromTestCase(AdmissionTests),
+            unittest.defaultTestLoader.loadTestsFromTestCase(CoverageReportingTests),
+        ])
+        return int(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
+    if args.once and (args.cycles is not None or args.discovery_hours is not None or args.drain_followups):
+        parser.error("--once cannot combine with --cycles/--discovery-hours/--drain-followups")
+    if args.discovery_hours is not None:
+        if not 1 <= args.discovery_hours <= 168:
+            parser.error("--discovery-hours must be 1..168")
+        if not args.drain_followups:
+            parser.error("--discovery-hours REQUIRES --drain-followups for 24h outcome continuity")
+        if args.cycles is not None:
+            parser.error("--cycles and --discovery-hours cannot be combined")
+    if args.drain_followups and args.cycles is None and args.discovery_hours is None:
+        parser.error("--drain-followups requires --cycles or --discovery-hours")
+    if args.cycles is not None and args.cycles < 1:
+        parser.error("--cycles must be >=1")
+    if not (args.interval >= 60 and args.discovery_every >= 60 and
+            1 <= args.max_pools <= 90 and 0 <= args.mature_max_pools <= 20
+            and args.gecko_pages == 1):
+        parser.error("interval/discovery >=60; max-pools 1..90; mature-reserved-pools 0..20; gecko-pages must be 1")
+    if args.with_promoted_discovery and args.no_paid_discovery:
+        parser.error("contradictory promoted options")
+    cfg = Config(db=args.db, interval=args.interval, discovery_every=args.discovery_every,
+                 max_pools=args.max_pools, mature_max_pools=args.mature_max_pools,
+                 promoted=args.with_promoted_discovery)
+    db = None
+    try:
+        db = Store(cfg.db, write=not (args.report or args.export_csv or args.export_exploratory_csv
+                                      or args.export_candidates_csv))
+        if args.report:
+            report(db)
+        if args.export_csv:
+            export_csv(db, args.export_csv)
+        if args.export_exploratory_csv:
+            export_exploratory_csv(db, args.export_exploratory_csv)
+        if args.export_candidates_csv:
+            export_candidates_csv(db, args.export_candidates_csv)
+        if not (args.report or args.export_csv or args.export_exploratory_csv or args.export_candidates_csv):
+            Scanner(cfg, db).run(1 if args.once else args.cycles,
+                                 discovery_hours=args.discovery_hours,
+                                 drain_followups=args.drain_followups)
+        return 0
+    except (WriterLocked, ValueError, FileNotFoundError, sqlite3.DatabaseError) as exc:
+        LOG.error("Cannot proceed safely: %s", exc)
+        return 2
+    finally:
+        if db:
+            db.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
